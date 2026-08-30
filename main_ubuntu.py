@@ -17,7 +17,7 @@ from matplotlib.figure import Figure
 ROOT_FOLDER = Path(__file__).resolve().parent / 'Kiethley_data'
 ROOT_FOLDER.mkdir(exist_ok=True)
 DELAY_MS    = 5
-PREFACTOR   = 1e12          # C -> pC
+PREFACTOR   = 1e9           # A -> nA
 
 # On Ubuntu, USB-serial adapters show up as /dev/ttyUSB* or /dev/ttyACM*
 # instead of COM ports. Set SERIAL_PORT explicitly if you know it
@@ -29,8 +29,8 @@ PLOT_WINDOW_S = 10          # width of the scrolling view
 ECHO_RAW    = True          # print repr(raw) to console, like the old script
 # ================================
 
-SETUP_CMD = (b"*RST; :SYST:ZCH ON; :SENS:FUNC 'CHAR'; CHAR:RANG 20e-9; "
-             b":SENS:CHAR:NPLC 1; :FORM:ELEM READ; :SYST:ZCH OFF; "
+SETUP_CMD = (b"*RST; :SYST:ZCH ON; :SENS:FUNC 'CURR'; :CURR:RANG 20e-9; "
+             b":SENS:CURR:NPLC 1; :FORM:ELEM READ; :SYST:ZCH OFF; "
              b":CALC2:NULL:STAT ON\n")
 
 
@@ -48,7 +48,7 @@ def find_serial_port():
 
 
 class AcquisitionThread(threading.Thread):
-    """Owns the serial port. Pushes (t, q) samples to a queue for the GUI."""
+    """Owns the serial port. Pushes (t, i) samples to a queue for the GUI."""
 
     def __init__(self, port, baudrate, delay_ms, out_queue, filepath):
         super().__init__(daemon=True)
@@ -68,7 +68,7 @@ class AcquisitionThread(threading.Thread):
             with serial.Serial(self.port, self.baudrate, timeout=5) as em, \
                  open(self.filepath, 'w') as f:
 
-                f.write('time,charge\n')
+                f.write('time,current\n')
                 f.flush()                      # header on disk immediately
                 em.write(SETUP_CMD)
                 t0 = time.time()
@@ -129,7 +129,7 @@ class ElectrometerApp:
         self.fig = Figure(figsize=(6, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel('time [s]')
-        self.ax.set_ylabel('charge [pC]')
+        self.ax.set_ylabel('current [nA]')
         self.line, = self.ax.plot([], [], 'ro-', markersize=3)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=root)
