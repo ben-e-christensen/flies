@@ -46,7 +46,7 @@ IS_LINUX = platform.system() == 'Linux'
 
 # --- electrometer ---
 DELAY_MS      = 5
-SERIAL_PORT   = '/dev/ttyUSB0' if IS_LINUX else 'COM21'
+SERIAL_PORT   = '/dev/ttyUSB0' if IS_LINUX else 'COM4'
 BAUDRATE      = 9600
 PLOT_WINDOW_S = 10
 ECHO_RAW      = False
@@ -57,7 +57,7 @@ RES_OHM       = 5.15e6       # 5.15 MΩ
 TAU_S         = RES_OHM * CAP_F   # ≈ 0.481 s
 
 # --- Brio webcams (OpenCV) ---
-BRIO_INDICES   = [0]          # v4l2 /dev/video indices or DShow indices
+BRIO_INDICES   = [0,1]          # v4l2 /dev/video indices or DShow indices
 BRIO_WIDTH     = 1920
 BRIO_HEIGHT    = 1080
 BRIO_FPS       = 15
