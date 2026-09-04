@@ -45,23 +45,28 @@ IS_LINUX = platform.system() == 'Linux'
 # --- electrometer ---
 DELAY_MS      = 5
 PREFACTOR     = 1e12          # C -> pC
-SERIAL_PORT   = '/dev/ttyUSB0' if IS_LINUX else 'COM23'
+SERIAL_PORT   = '/dev/ttyUSB0' if IS_LINUX else 'COM25'
 BAUDRATE      = 9600
 PLOT_WINDOW_S = 10
 ECHO_RAW      = False
+
+# --- Arduino relay controller ---
+RELAY_ENABLED = True
+RELAY_PORT    = '/dev/ttyACM0' if IS_LINUX else 'COM24'
+RELAY_BAUD    = 9600
 
 # --- Brio webcams (OpenCV) ---
 BRIO_INDICES   = [0, 1]         # v4l2 /dev/video indices or DShow indices
 BRIO_WIDTH     = 1920
 BRIO_HEIGHT    = 1080
-BRIO_FPS       = 30
-BRIO_SAVE_FPS  = 10
+BRIO_FPS       = 15
+BRIO_SAVE_FPS  = 5
 BRIO_QUEUE_MAX = 200
 
 # --- FLIR Grasshopper3 (PySpin) ---
 FLIR_ENABLED   = True            # set False if Spinnaker not installed
 FLIR_FPS       = 10              # acquisition frame rate
-FLIR_SAVE_FPS  = 10
+FLIR_SAVE_FPS  = 5
 FLIR_QUEUE_MAX = 100
 FLIR_SAVE_FMT  = '.png'         # .png for 16-bit mono, .jpg for 8-bit
 
@@ -400,7 +405,10 @@ class SpinnakerCamera(threading.Thread):
                 image.Release()
                 self._on_frame(raw, preview)
 
-            cam.EndAcquisition()
+            try:
+                cam.EndAcquisition()
+            except PySpin.SpinnakerException:
+                pass
 
         except Exception:
             self.error = traceback.format_exc()
@@ -511,6 +519,17 @@ class ElectrometerApp:
         self.q_vec = []
         self.session_dir = None
 
+        # --- Arduino relay connection ---
+        self.relay_ser = None
+        if RELAY_ENABLED:
+            try:
+                self.relay_ser = serial.Serial(RELAY_PORT, RELAY_BAUD,
+                                               timeout=1)
+                time.sleep(2)       # Arduino resets on serial open
+                print(f'[relay] connected on {RELAY_PORT}')
+            except Exception as e:
+                print(f'[relay] could not open {RELAY_PORT}: {e}')
+
         # --- controls ---
         controls = ttk.Frame(root, padding=8)
         controls.pack(side=tk.TOP, fill=tk.X)
@@ -526,6 +545,25 @@ class ElectrometerApp:
         self.status_var = tk.StringVar(value='Idle')
         ttk.Label(controls, textvariable=self.status_var).pack(side=tk.LEFT,
                                                                padx=12)
+
+        # --- relay buttons ---
+        relay_frame = ttk.LabelFrame(controls, text='Relays', padding=4)
+        relay_frame.pack(side=tk.RIGHT, padx=8)
+
+        ttk.Button(relay_frame, text='Lamp A',
+                   command=lambda: self._relay_send('a')).pack(side=tk.LEFT,
+                                                               padx=2)
+        ttk.Button(relay_frame, text='Lamp B',
+                   command=lambda: self._relay_send('b')).pack(side=tk.LEFT,
+                                                               padx=2)
+        ttk.Button(relay_frame, text='Both Off',
+                   command=lambda: self._relay_send('o')).pack(side=tk.LEFT,
+                                                               padx=2)
+
+        self.relay_var = tk.StringVar(
+            value='connected' if self.relay_ser else 'not connected')
+        ttk.Label(relay_frame, textvariable=self.relay_var).pack(side=tk.LEFT,
+                                                                  padx=6)
 
         # --- body: plots left, previews right ---
         body = ttk.Frame(root)
@@ -568,6 +606,19 @@ class ElectrometerApp:
 
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         self.root.after(PREVIEW_MS, self._update_previews)
+
+    def _relay_send(self, cmd):
+        """Send a single character to the Arduino relay controller."""
+        if self.relay_ser is None or not self.relay_ser.is_open:
+            self.relay_var.set('not connected')
+            return
+        try:
+            self.relay_ser.write(cmd.encode())
+            labels = {'a': 'Lamp A ON', 'b': 'Lamp B ON', 'o': 'Both OFF'}
+            self.relay_var.set(labels.get(cmd, cmd))
+        except Exception as e:
+            self.relay_var.set(f'error: {e}')
+            print(f'[relay] write error: {e}')
 
     def _add_cam_panel(self, parent, cam, ext):
         frame = ttk.LabelFrame(parent, text=cam.cam_name, padding=4)
@@ -776,6 +827,12 @@ class ElectrometerApp:
             cam.stop()
         for cam in self.cams:
             cam.join(timeout=3)
+        if self.relay_ser is not None:
+            try:
+                self.relay_ser.write(b'o')   # both off on exit
+                self.relay_ser.close()
+            except Exception:
+                pass
         self.root.destroy()
 
 
