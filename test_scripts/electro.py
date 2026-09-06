@@ -1,16 +1,21 @@
+import sys
 import os, time
 from datetime import datetime
 from pathlib import Path
 import numpy as np
 import serial
 import matplotlib.pyplot as plt
+
+# repo root on sys.path so `coms` (the port map) is importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from coms import port
 # ============ CONFIG ============
 ROOT_FOLDER = Path(__file__).resolve().parent / 'Kiethley_data'
 ROOT_FOLDER.mkdir(exist_ok=True)
 DELAY_MS    = 5
 DURATION_S  = 15       # None = run until Ctrl+C
 PREFACTOR   = 1e12      # C -> pC
-SERIAL_PORT = 'COM19'
+SERIAL_PORT = port('keithley')
 BAUDRATE    = 9600
 # ================================
 SETUP_CMD = (b"*RST; :SYST:ZCH ON; :SENS:FUNC 'CHAR'; CHAR:RANG 20e-9; "

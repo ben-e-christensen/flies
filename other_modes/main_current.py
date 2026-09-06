@@ -18,6 +18,7 @@ Output:
         flir_frames.csv
 """
 
+import sys
 import queue
 import subprocess
 import threading
@@ -35,6 +36,10 @@ from PIL import Image, ImageTk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+# repo root on sys.path so `coms` (the port map) is importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from coms import port
+
 # ============ CONFIG ============
 ROOT_FOLDER = Path(__file__).resolve().parent / 'Kiethley_data'
 ROOT_FOLDER.mkdir(exist_ok=True)
@@ -42,7 +47,7 @@ ROOT_FOLDER.mkdir(exist_ok=True)
 # --- electrometer ---
 DELAY_MS      = 5
 PREFACTOR     = 1e9           # A -> nA
-SERIAL_PORT   = 'COM22'
+SERIAL_PORT   = port('keithley')
 BAUDRATE      = 9600
 PLOT_WINDOW_S = 10
 ECHO_RAW      = False

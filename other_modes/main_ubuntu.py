@@ -1,3 +1,4 @@
+import sys
 import glob
 import queue
 import threading
@@ -13,6 +14,10 @@ import serial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+# repo root on sys.path so `coms` (the port map) is importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from coms import port
+
 # ============ CONFIG ============
 ROOT_FOLDER = Path(__file__).resolve().parent / 'Kiethley_data'
 ROOT_FOLDER.mkdir(exist_ok=True)
@@ -23,7 +28,7 @@ PREFACTOR   = 1e9           # A -> nA
 # instead of COM ports. Set SERIAL_PORT explicitly if you know it
 # (e.g. '/dev/ttyUSB0'), otherwise leave as None to auto-detect the
 # first matching device at Start time.
-SERIAL_PORT = None
+SERIAL_PORT = port('keithley')
 BAUDRATE    = 9600
 PLOT_WINDOW_S = 10          # width of the scrolling view
 ECHO_RAW    = True          # print repr(raw) to console, like the old script

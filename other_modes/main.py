@@ -1,3 +1,4 @@
+import sys
 import queue
 import threading
 import time
@@ -12,12 +13,16 @@ import serial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+# repo root on sys.path so `coms` (the port map) is importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from coms import port
+
 # ============ CONFIG ============
 ROOT_FOLDER = Path(__file__).resolve().parent / 'Kiethley_data'
 ROOT_FOLDER.mkdir(exist_ok=True)
 DELAY_MS    = 5
 PREFACTOR   = 1e12          # C -> pC
-SERIAL_PORT = 'COM4'
+SERIAL_PORT = port('keithley')
 BAUDRATE    = 9600
 PLOT_WINDOW_S = 10          # width of the scrolling view
 ECHO_RAW    = True          # print repr(raw) to console, like the old script

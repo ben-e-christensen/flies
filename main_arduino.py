@@ -36,6 +36,8 @@ from PIL import Image, ImageTk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+from coms import port
+
 # ============ CONFIG ============
 ROOT_FOLDER = Path(__file__).resolve().parent / 'Kiethley_data'
 ROOT_FOLDER.mkdir(exist_ok=True)
@@ -45,14 +47,14 @@ IS_LINUX = platform.system() == 'Linux'
 # --- electrometer ---
 DELAY_MS      = 5
 PREFACTOR     = 1e12          # C -> pC
-SERIAL_PORT   = '/dev/ttyUSB0' if IS_LINUX else 'COM25'
+SERIAL_PORT   = port('keithley')
 BAUDRATE      = 9600
 PLOT_WINDOW_S = 10
 ECHO_RAW      = False
 
 # --- Arduino relay controller ---
 RELAY_ENABLED = True
-RELAY_PORT    = '/dev/ttyACM0' if IS_LINUX else 'COM24'
+RELAY_PORT    = port('arduino')
 RELAY_BAUD    = 9600
 
 # --- Brio webcams (OpenCV) ---
