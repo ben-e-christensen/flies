@@ -33,7 +33,7 @@ import numpy as np
 SEGMENT_DURATION = 10.0       # seconds per snapshot window
 
 # (start_s, end_s, label, snapshot)
-BLOCKS = [(0,100, 'baseline', False),]
+BLOCKS = [(25,35, 'baseline', False),]
 # ================================
 
 
