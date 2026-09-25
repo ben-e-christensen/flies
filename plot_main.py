@@ -1,27 +1,20 @@
-"""Plot charge-mode electrometer sessions — one PNG per block.
+"""Plot charge across an entire session's electrometer.csv.
 
 Usage:
-    python plot_charge.py path/to/session_folder
-    python plot_charge.py path/to/electrometer.csv
+    python plot_session.py path/to/session_folder
 
-Reads electrometer.csv (time, charge in Coulombs) and produces per-block
-charge [pC] plots with mean/std-dev annotations.
+Marks:
+    dashed lines     events from events.csv (red trigger, blue manual)
+    cyan bands       spans covered by FLIR bursts (flir_frames.csv), so you
+                     can see which parts of the run have video and which
+                     were 'dead' periods
 
-Block format:
-    (start_s, end_s, label, snapshot)
-
-    start_s   — start time in seconds (None = beginning of file)
-    end_s     — end time in seconds   (None = end of file)
-    label     — string label (optional, auto-numbered)
-    snapshot  — if True, also produce 10-second segment PNGs (optional,
-                default False)
-
-Output (per block):
-    <label>.png
-    <label>_seg_000.0-010.0s.png   (if snapshot=True)
-    ...
+Opens an interactive window (use the zoom tool to dig into a stretch) and
+saves session_charge.png in the session folder.  Works for both voltage-mode
+(Q = C*V, C from meta.txt) and old charge-mode sessions.
 """
 
+import csv
 import sys
 from pathlib import Path
 
@@ -30,160 +23,115 @@ import numpy as np
 
 
 # ============ CONFIG ============
-SEGMENT_DURATION = 10.0       # seconds per snapshot window
-
-# (start_s, end_s, label, snapshot)
-BLOCKS = [(25,35, 'baseline', False),]
+DEFAULT_CAP_F = 1e-9     # used if meta.txt has no cap_F
+SHOW = True              # False = just save the PNG
 # ================================
 
 
-def load_session(path: Path):
-    """Return (time, charge) arrays in SI from an electrometer.csv."""
-    if path.is_dir():
-        csv = path / 'electrometer.csv'
-    else:
-        csv = path
-    if not csv.exists():
-        sys.exit(f'Not found: {csv}')
+def read_meta(session):
+    meta = {}
+    p = session / 'meta.txt'
+    if p.exists():
+        for line in open(p):
+            if '\t' in line:
+                k, v = line.rstrip('\n').split('\t', 1)
+                meta[k] = v
+    return meta
 
-    data = np.genfromtxt(csv, delimiter=',', skip_header=1,
+
+def load_charge(session):
+    path = session / 'electrometer.csv'
+    with open(path) as f:
+        header = f.readline().strip().split(',')
+    data = np.genfromtxt(path, delimiter=',', skip_header=1,
                          filling_values=np.nan)
-    if data.ndim != 2 or data.shape[1] < 2:
-        sys.exit(f'Unexpected shape in {csv}: {data.shape}')
+    t = data[:, header.index('time')]
+    if 'voltage_V' in header:
+        cap = float(read_meta(session).get('cap_F', DEFAULT_CAP_F))
+        q = data[:, header.index('voltage_V')] * cap * 1e12
+        print(f'voltage mode, C = {cap * 1e9:g} nF')
+    else:
+        q = data[:, header.index('charge')] * 1e12
+        print('charge mode')
+    return t, q
 
-    t = data[:, 0]
-    q = data[:, 1]
-    return t, q, csv.parent
 
-
-def parse_blocks(blocks, t):
-    """Parse block tuples into a clean list of dicts."""
+def load_events(session):
+    p = session / 'events.csv'
+    if not p.exists():
+        return []
     out = []
-    for i, entry in enumerate(blocks):
-        t0 = entry[0]
-        t1 = entry[1]
-        name = entry[2] if len(entry) >= 3 else None
-        snapshot = entry[3] if len(entry) >= 4 else False
-
-        i0 = 0 if t0 is None else np.searchsorted(t, t0)
-        i1 = len(t) if t1 is None else np.searchsorted(t, t1)
-
-        t0_s = t0 if t0 is not None else 0
-        t1_s = t1 if t1 is not None else t[-1]
-
-        if name:
-            label = name
-            title = f'{name}  [{t0_s:.1f} \u2013 {t1_s:.1f} s]'
-        else:
-            label = f'block_{i}'
-            title = f'block {i}  [{t0_s:.1f} \u2013 {t1_s:.1f} s]'
-
-        out.append({
-            'label': label,
-            'title': title,
-            'i0': i0,
-            'i1': i1,
-            't0': t0_s,
-            't1': t1_s,
-            'snapshot': snapshot,
-        })
+    with open(p, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                out.append((float(row['time']), int(row['event']),
+                            row.get('source', 'trigger') or 'trigger'))
+            except (KeyError, ValueError):
+                pass
     return out
 
 
-def slugify(s):
-    """Turn a label into a safe filename."""
-    return s.lower().replace(' ', '_').replace('-', '_')
-
-
-def plot_block(tb, qb, title, out_path):
-    """Single-panel charge plot. Saves to out_path."""
-    q_pc = qb * 1e12
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-
-    ax.plot(tb, q_pc, 'r.-', markersize=2, alpha=0.8)
-    ax.axhline(0, color='k', linewidth=0.3)
-    ax.set_ylabel('Charge [pC]')
-    ax.set_xlabel('Time [s]')
-    ax.set_title(title)
-    ax.yaxis.set_major_locator(plt.MaxNLocator(20))
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f'  Saved {out_path.name}')
+def load_bursts(session):
+    """[(t_start, t_end, event)] from flir_frames.csv."""
+    p = session / 'flir_frames.csv'
+    if not p.exists():
+        return []
+    spans = {}
+    with open(p, newline='') as f:
+        for row in csv.DictReader(f):
+            ev, t = int(row['event']), float(row['time'])
+            lo, hi = spans.get(ev, (t, t))
+            spans[ev] = (min(lo, t), max(hi, t))
+    return [(lo, hi, ev) for ev, (lo, hi) in sorted(spans.items())]
 
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit('Usage: python plot_charge.py '
-                 '<session_folder or electrometer.csv>')
+        sys.exit('Usage: python plot_session.py <session_folder>')
+    session = Path(sys.argv[1])
+    if not (session / 'electrometer.csv').exists():
+        sys.exit(f'Not found: {session / "electrometer.csv"}')
 
-    path = Path(sys.argv[1])
-    t, q, out_dir = load_session(path)
+    t, q = load_charge(session)
+    events = load_events(session)
+    bursts = load_bursts(session)
+    ok = ~np.isnan(q)
+    print(f'{len(t):,} samples over {t[-1] / 60:.1f} min '
+          f'({(~ok).sum():,} NaN), {len(events)} events, '
+          f'{len(bursts)} FLIR bursts')
 
-    n_nan = np.isnan(q).sum()
-    print(f'Loaded {len(t)} samples, {n_nan} NaN')
-    print(f'Time span: {t[-1] - t[0]:.3f} s')
-    print(f'Charge range: {np.nanmin(q)*1e12:.4f} \u2013 {np.nanmax(q)*1e12:.4f} pC')
+    fig, ax = plt.subplots(figsize=(15, 5))
+    ax.plot(t, q, color='k', lw=0.6)
 
-    if not BLOCKS:
-        blocks = [{'label': 'all', 'title': 'all', 'i0': 0, 'i1': len(t),
-                    't0': 0, 't1': t[-1], 'snapshot': False}]
-    else:
-        blocks = parse_blocks(BLOCKS, t)
+    for lo, hi, ev in bursts:
+        ax.axvspan(lo, hi, color='tab:cyan', alpha=0.18, zorder=0)
+    colors = {'trigger': 'tab:red', 'manual': 'tab:blue'}
+    for te, n, src in events:
+        ax.axvline(te, color=colors.get(src, 'tab:red'), lw=0.8, ls='--',
+                   alpha=0.7)
+        ax.text(te, 1.0, f' {n}', transform=ax.get_xaxis_transform(),
+                fontsize=7, va='bottom', color=colors.get(src, 'tab:red'))
 
-    for blk in blocks:
-        tb = t[blk['i0']:blk['i1']]
-        qb = q[blk['i0']:blk['i1']]
+    ax.set_xlim(t[0], t[-1])
+    ax.set_xlabel('time since Start [s]')
+    ax.set_ylabel('Q [pC]')
+    ax.grid(True, alpha=0.3)
 
-        if len(tb) == 0:
-            print(f'\n[{blk["label"]}]  \u2014 no data in range, skipping')
-            continue
+    # minutes along the top, for orienting in a long run
+    top = ax.secondary_xaxis('top', functions=(lambda s: s / 60,
+                                               lambda m: m * 60))
+    top.set_xlabel('[min]', fontsize=8)
 
-        slug = slugify(blk['label'])
+    ax.set_title(f'{session.name}   ({t[-1] / 60:.1f} min, '
+                 f'{len(events)} events; cyan = FLIR bursts, '
+                 f'red trigger / blue manual)', fontsize=10, pad=22)
+    fig.tight_layout()
 
-        q_std = np.nanstd(qb * 1e12)
-        print(f'\n[{blk["label"]}]  {len(tb)} pts  '
-              f'\u03c3_Q={q_std:.4f} pC')
-
-        # --- main block plot ---
-        plot_block(tb, qb, blk['title'],
-                   out_dir / f'{slug}.png')
-
-        # --- segment snapshots ---
-        if blk['snapshot']:
-            seg_start = tb[0]
-            seg_end = tb[-1]
-            cursor = seg_start
-            seg_num = 0
-
-            while cursor < seg_end:
-                win_end = min(cursor + SEGMENT_DURATION, seg_end)
-                si0 = np.searchsorted(tb, cursor)
-                si1 = np.searchsorted(tb, win_end)
-
-                if si1 <= si0:
-                    cursor = win_end
-                    continue
-
-                seg_t = tb[si0:si1]
-                seg_q = qb[si0:si1]
-
-                seg_title = (f'{blk["label"]}  '
-                             f'[{cursor:.1f} \u2013 {win_end:.1f} s]')
-                seg_fname = f'{slug}_seg_{cursor:07.1f}-{win_end:07.1f}s.png'
-
-                plot_block(seg_t, seg_q, seg_title,
-                           out_dir / seg_fname)
-
-                cursor = win_end
-                seg_num += 1
-
-            print(f'  \u2192 {seg_num} segment snapshots')
-
-    print('\nDone.')
+    out = session / 'session_charge.png'
+    fig.savefig(out, dpi=150)
+    print(f'saved {out}')
+    if SHOW:
+        plt.show()
 
 
 if __name__ == '__main__':
