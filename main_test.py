@@ -1,31 +1,31 @@
-"""UNTESTED: automated light-cycling electrometer + FLIR burst capture.
+"""TEST VARIANT (UNTESTED): dual FLIR burst capture + continuous 20 fps save
+of camera A while lamp CONT_LAMP (currently B) is on.
 
-Built from main_arduino.py, with three changes:
+Same as main_flir_dual.py (both cameras cache every light phase and dump on a
+blip), plus:
 
-  1. No Brio webcams.  The FLIR Grasshopper3 is the only camera.
-  2. The lamps run themselves.  Start begins the cycle:
-
-         lamp A on  ->  wait for a charge blip  ->  both lamps off for
-         DARK_S  ->  lamp B on  ->  wait for a blip  ->  dark  ->  ...
-
-     A "blip" is a rise of >= CHARGE_RISE_PC picocoulombs inside a
-     TRIGGER_WINDOW_S sliding window.
-  3. The FLIR does not save continuously.  It keeps the last CACHE_SECONDS
-     of frames in a RAM ring buffer and dumps them to disk only when a blip
-     fires.  Because charge is cumulative, the blip is detected at its END,
-     so a 10 s buffer holds the 5 s blip plus the 5 s leading up to it.
-     Nothing is cached at all while the lamps are off.
-
-The manual Lamp A / Lamp B / Both Off buttons still work; pressing one
-switches the automation off so it cannot fight you.
+  * While lamp CONT_LAMP is on (automation OR manual press), camera A also
+    saves every CONT_EVERY-th frame (60 fps / 3 = 20 fps) straight to disk,
+    blip or no blip, downscaled to CONT_SIZE.  Stops the moment that lamp
+    turns off or the other lamp turns on.
+  * Continuous frames go through a BOUNDED queue into a pool of
+    CONT_WRITERS threads.  If the disk/encoder falls behind, frames are
+    dropped and counted instead of eating RAM forever.
+  * PNGs are written at compression level PNG_LEVEL (1 = fast).  Set
+    CONT_FMT = '.npy' for zero encode cost if PNG can't keep up.
 
 Output:
-    Kiethley_data/session_<stamp>/
+    E:/Ben Christensen/FLIES/session_<stamp>/
         meta.txt
         electrometer.csv          time,charge,trigger
-        events.csv                event,time,lamp,frames
-        flir/e001_0000.png ...    one burst per event
-        flir_frames.csv           time,event,filename
+        events.csv                event,time,lamp,rec_cam,frames
+        flir_a/e001_0000.png ...  blip bursts from camera A
+        flir_b/e001_0000.png ...  blip bursts from camera B
+        flir_a_frames.csv         time,event,filename
+        flir_b_frames.csv         time,event,filename
+        flir_a_cont/p001_000000.png ...   continuous, p = lamp phase #
+        flir_a_cont_frames.csv    time,phase,filename  (unsorted - multiple
+                                                        writer threads)
 """
 
 import math
@@ -50,8 +50,8 @@ from matplotlib.figure import Figure
 from coms import port
 
 # ============ CONFIG ============
-ROOT_FOLDER = Path(__file__).resolve().parent / 'Kiethley_data'
-ROOT_FOLDER.mkdir(exist_ok=True)
+ROOT_FOLDER = Path(r'E:\Ben Christensen\FLIES')
+ROOT_FOLDER.mkdir(parents=True, exist_ok=True)
 
 IS_LINUX = platform.system() == 'Linux'
 
@@ -67,100 +67,145 @@ ECHO_RAW      = False
 RELAY_ENABLED = True
 RELAY_PORT    = port('arduino')
 RELAY_BAUD    = 9600
-LAMP_CMDS     = ('b', 'a')    # single chars the sketch understands
+LAMP_CMDS     = ('a', 'b')    # single chars the sketch understands
 LAMPS_OFF_CMD = 'o'
 
 # --- blip detector ---
-CHARGE_RISE_PC   = 10.0       # pC of rise that counts as a blip
+CHARGE_RISE_PC   = 10.0       # pC of swing that counts as a blip (window)
 TRIGGER_WINDOW_S = 5.0        # ...within this sliding window
+JUMP_PC          = 1.0        # pC step between consecutive samples that
+                              # counts as a blip regardless of the window
 
 # --- light cycle ---
-AUTOMATION_ON = True          # Start also starts the lamp cycle
-DARK_S        = 20 * 60       # both lamps off between blips
+AUTOMATION_ON  = True         # Start also starts the lamp cycle
+DARK_S         = 20 * 60      # both lamps off between blips
 LIGHT_LINGER_S = 30           # keep the lamp on this long after a blip
-LIGHT_MAX_S   = None          # give up waiting after this many s (None = forever)
+LIGHT_MAX_S    = None         # give up waiting after this many s (None = forever)
 
 # --- FLIR Grasshopper3 (PySpin) ---
-FLIR_ENABLED  = True          # set False if Spinnaker not installed
+FLIR_ENABLED    = True        # set False if Spinnaker not installed
+FLIR2_ENABLED   = True        # second camera
+CACHE_BOTH_CAMS = True        # True: both cams cache every light phase
+                              # False: only the cam opposite the lit lamp
 FLIR_FPS      = 60            # acquisition rate; also the ring-buffer rate
-CACHE_SECONDS = 10.0          # 5 s blip + 5 s of lead-in
-POST_ROLL_S   = 0.0           # extra seconds to keep caching after a blip.
-                              # Leave at 0: the lamps go off at the trigger,
-                              # so post-roll frames would just be dark.
+CACHE_SECONDS = 20.0          # 5 s lead-in + 15 s post-roll
+POST_ROLL_S   = 15.0          # seconds to keep caching after a blip fires
 FLIR_SAVE_FMT = '.png'        # .png for 16-bit mono, .jpg for 8-bit
+PNG_LEVEL     = 1             # PNG compression 0-9; 1 is ~2-3x faster than 3
+
+# --- continuous save (TEST): cam A while lamp A is on ---
+CONT_ENABLED   = True
+CONT_LAMP      = 'b'          # lamp that turns continuous saving on
+CONT_FPS       = 20           # target save rate (should divide FLIR_FPS)
+CONT_WRITERS   = 3            # writer threads; cv2.imwrite releases the GIL
+CONT_QUEUE_MAX = 1200         # frames buffered before dropping
+                              # (1200 x ~4.1 MB = ~5 GB, ~60 s of backlog)
+CONT_FMT       = '.png'       # '.png' or '.npy' (raw, no encode cost)
+CONT_SIZE      = (1280, 720)  # (w, h) to downscale continuous frames to,
+                              # or None for the full ROI
+CONT_8BIT      = False        # True -> also drop continuous frames to 8-bit
 
 # --- FLIR resolution / RAM tradeoff -------------------------------------
-# The ring buffer holds RAW frames in memory, so its size is
-#     CACHE_SECONDS * FLIR_FPS * width * height * bytes_per_pixel
-# Full sensor at Mono16 and 60 fps is a few GB.  Shrink it here if that is
-# too much; the startup banner and the GUI both print the actual number.
-# These are read when the camera thread starts, so change them and restart.
-FLIR_ROI    = (1280, 960)     # centered crop (w, h), or None for full sensor
+# Ring buffer size = CACHE_SECONDS * FLIR_FPS * width * height * bytes/px
+FLIR_ROI    = (1920, 1080)    # centered crop (w, h), or None for full sensor
 FLIR_MONO16 = True            # False -> Mono8, which halves the RAM
 
 # --- preview ---
-PREVIEW_W  = 360
-PREVIEW_MS = 150
+PREVIEW_W  = 720
+PREVIEW_MS = 300
 # ================================
 
 CACHE_FRAMES = max(1, int(round(CACHE_SECONDS * FLIR_FPS)))
+CONT_EVERY   = max(1, int(round(FLIR_FPS / CONT_FPS)))
+if FLIR_FPS % CONT_FPS:
+    print(f'[cont] warning: {FLIR_FPS} fps / {CONT_FPS} is not an integer, '
+          f'saving every {CONT_EVERY} frames '
+          f'(~{FLIR_FPS / CONT_EVERY:.1f} fps)')
 
 SETUP_CMD = (b"*RST; :SYST:ZCH ON; :SENS:FUNC 'CHAR'; CHAR:RANG 20e-9; "
              b":SENS:CHAR:NPLC 1; :FORM:ELEM READ; :SYST:ZCH OFF; "
              b":CALC2:NULL:STAT ON\n")
+
+ZCHK_CMD = b":SYST:ZCH ON; :CALC2:NULL:STAT ON; :SYST:ZCH OFF\n"
 
 try:
     import PySpin
     HAS_PYSPIN = True
 except ImportError:
     HAS_PYSPIN = False
-    if FLIR_ENABLED:
-        print('[FLIR] PySpin not installed - FLIR camera disabled')
+    if FLIR_ENABLED or FLIR2_ENABLED:
+        print('[FLIR] PySpin not installed - FLIR cameras disabled')
         FLIR_ENABLED = False
+        FLIR2_ENABLED = False
 
 
 def cache_ram_mb():
-    """Rough RAM the ring buffer will occupy, in MB."""
+    """Rough RAM ONE ring buffer will occupy, in MB."""
     w, h = FLIR_ROI if FLIR_ROI else (1920, 1200)
     return CACHE_FRAMES * w * h * (2 if FLIR_MONO16 else 1) / 1e6
+
+
+def png_params(ext):
+    return [cv2.IMWRITE_PNG_COMPRESSION, PNG_LEVEL] if ext == '.png' else []
 
 
 # ------------------------------------------------------------- blip detector
 
 class ChargeTrigger:
-    """Fires once when charge rises by >= thresh_pc inside a sliding window.
+    """Fires once when EITHER condition is met:
 
-    Charge mode is cumulative, so this is really a rate threshold.  update()
-    returns True for exactly one sample per armed cycle - the sample at which
-    the rise completed.  That single True is the `trigger` column in
-    electrometer.csv; the blip it refers to is the window
-    [t - TRIGGER_WINDOW_S, t].
+      1. Charge swings by >= thresh_pc inside a sliding window
+         (slow accumulation — e.g. 10 pC over 5 s).
+      2. Charge jumps by >= jump_pc between two consecutive samples
+         (sharp step — e.g. 1 pC in one reading).
+
+    update() returns True for exactly one sample per armed cycle.
     """
 
-    def __init__(self, window_s=TRIGGER_WINDOW_S, thresh_pc=CHARGE_RISE_PC):
+    def __init__(self, window_s=TRIGGER_WINDOW_S, thresh_pc=CHARGE_RISE_PC,
+                 jump_pc=JUMP_PC):
         self.window_s = window_s
         self.thresh_pc = thresh_pc
+        self.jump_pc = jump_pc
         self._buf = deque()          # (t, q_pC) inside the window
+        self._prev = None            # previous q_pC for jump detection
         self._armed = False
         self.fired_at = None
 
     def arm(self):
         self._buf.clear()
+        self._prev = None
         self._armed = True
         self.fired_at = None
 
     def disarm(self):
         self._buf.clear()
+        self._prev = None
         self._armed = False
+
+    def reset(self):
+        """Clear detection state without disarming.  Call after ZCHK."""
+        self._buf.clear()
+        self._prev = None
 
     def update(self, t, q_pc):
         if not self._armed or math.isnan(q_pc):
             return False
 
+        # --- condition 2: single-sample jump ---
+        if self._prev is not None and abs(q_pc - self._prev) >= self.jump_pc:
+            self.fired_at = t
+            self._armed = False
+            self._prev = q_pc
+            return True
+        self._prev = q_pc
+
+        # --- condition 1: swing over the sliding window ---
         self._buf.append((t, q_pc))
         while self._buf and t - self._buf[0][0] > self.window_s:
             self._buf.popleft()
 
+        # Need a full window before a swing across it means anything.
         if t - self._buf[0][0] < self.window_s * 0.9:
             return False
 
@@ -188,6 +233,7 @@ class AcquisitionThread(threading.Thread):
         self.filepath = filepath
         self.t0 = t0
         self.trigger = trigger
+        self.cmd_queue = queue.Queue()
         self._stop_event = threading.Event()
         self.error = None
 
@@ -219,6 +265,17 @@ class AcquisitionThread(threading.Thread):
                     f.write(f'{t},{val},{int(trig)}\n')
                     f.flush()
                     self.out_queue.put((t, val, trig))
+
+                    # drain any injected commands (e.g. ZCHK)
+                    try:
+                        while True:
+                            cmd = self.cmd_queue.get_nowait()
+                            em.write(cmd)
+                            self.trigger.reset()
+                            print(f'[keithley] sent {cmd}')
+                    except queue.Empty:
+                        pass
+
                     time.sleep(self.delay_s)
 
         except Exception:
@@ -236,13 +293,16 @@ class SpinnakerCamera(threading.Thread):
     While `caching` is set, every frame goes into a deque of CACHE_FRAMES.
     burst() schedules a dump: once POST_ROLL_S has elapsed the whole buffer
     is handed to the writer queue and caching stops until the next light
-    phase turns it back on.  While `caching` is clear the preview still
-    updates, but no frame can ever reach the disk.
+    phase turns it back on.
+
+    Independently, while `cont_active` is set, every CONT_EVERY-th frame is
+    pushed (non-blocking) onto `cont_queue` for continuous saving.
     """
 
-    def __init__(self, name='flir'):
+    def __init__(self, name='flir', pyspin_cam=None):
         super().__init__(daemon=True)
         self.cam_name = name
+        self._pyspin_cam = pyspin_cam   # passed in already Init'd
 
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -266,6 +326,15 @@ class SpinnakerCamera(threading.Thread):
         self._fps_n = 0
         self.error = None
 
+        # --- continuous save ---
+        self.cont_queue = None
+        self.cont_active = threading.Event()
+        self._cont_phase = 0
+        self._cont_n = 0                # frames seen this phase
+        self._cont_k = 0                # frames saved this phase
+        self.cont_queued = 0            # total pushed this session
+        self.cont_dropped = 0           # total dropped (queue full)
+
     def stop(self):
         self._stop_event.set()
 
@@ -284,6 +353,22 @@ class SpinnakerCamera(threading.Thread):
         self._dump_at = None
         with self._cache_lock:
             self.cache.clear()
+
+    def cont_arm(self, cont_queue):
+        """Attach the continuous-save queue for this session."""
+        self.cont_active.clear()
+        self.cont_queue = cont_queue
+        self.cont_queued = 0
+        self.cont_dropped = 0
+
+    def cont_set(self, on, phase=0):
+        if on:
+            self._cont_phase = phase
+            self._cont_n = 0
+            self._cont_k = 0
+            self.cont_active.set()
+        else:
+            self.cont_active.clear()
 
     def cache_len(self):
         with self._cache_lock:
@@ -310,6 +395,11 @@ class SpinnakerCamera(threading.Thread):
             s += '  cache off'
         if self.saved:
             s += f'  {self.saved} saved'
+        if self.cont_queue is not None:
+            state = 'ON' if self.cont_active.is_set() else 'off'
+            s += (f'\ncont {state}: {self.cont_queued} queued, '
+                  f'{self.cont_dropped} dropped, '
+                  f'backlog {self.cont_queue.qsize()}')
         return s
 
     # ---------- camera setup ----------
@@ -373,19 +463,12 @@ class SpinnakerCamera(threading.Thread):
             print(f'[{self.cam_name}] could not set ROI {want_w}x{want_h}: {e}')
 
     def run(self):
-        system = None
-        cam = None
-        cam_list = None
+        cam = self._pyspin_cam
+        if cam is None:
+            self.error = 'no camera object provided'
+            print(f'[{self.cam_name}] {self.error}')
+            return
         try:
-            system = PySpin.System.GetInstance()
-            cam_list = system.GetCameras()
-            if cam_list.GetSize() == 0:
-                self.error = 'no Spinnaker cameras found'
-                print(f'[{self.cam_name}] {self.error}')
-                return
-
-            cam = cam_list[0]
-            cam.Init()
             self._configure(cam.GetNodeMap())
             cam.BeginAcquisition()
 
@@ -424,17 +507,6 @@ class SpinnakerCamera(threading.Thread):
         except Exception:
             self.error = traceback.format_exc()
             print(f'[{self.cam_name}] {self.error}')
-        finally:
-            if cam is not None:
-                try:
-                    cam.DeInit()
-                except Exception:
-                    pass
-                del cam
-            if cam_list is not None:
-                cam_list.Clear()
-            if system is not None:
-                system.ReleaseInstance()
 
     def _on_frame(self, raw, preview):
         now = time.perf_counter()
@@ -451,6 +523,19 @@ class SpinnakerCamera(threading.Thread):
         if self.caching.is_set():
             with self._cache_lock:
                 self.cache.append((now - self.t0, raw))
+
+        # --- continuous save: every CONT_EVERY-th frame, never blocks ---
+        if self.cont_active.is_set() and self.cont_queue is not None:
+            if self._cont_n % CONT_EVERY == 0:
+                try:
+                    self.cont_queue.put_nowait(
+                        (now - self.t0, raw, self._cont_phase, self._cont_k))
+                    self.cont_queued += 1
+                except queue.Full:
+                    self.cont_dropped += 1
+                self._cont_k += 1       # index advances even on a drop,
+                                        # so gaps show up in the filenames
+            self._cont_n += 1
 
         if self._dump_at is not None and now >= self._dump_at:
             self._dump_at = None
@@ -473,10 +558,10 @@ class SpinnakerCamera(threading.Thread):
               f'{len(frames)} frames queued')
 
 
-# ----------------------------------------------------------- frame writer
+# ----------------------------------------------------------- frame writers
 
 class FrameWriter(threading.Thread):
-    """Writes bursts of frames to disk.  One file per frame, named by event."""
+    """Writes blip bursts to disk.  One file per frame, named by event."""
 
     def __init__(self, in_queue, out_dir, index_path, ext=FLIR_SAVE_FMT):
         super().__init__(daemon=True)
@@ -484,6 +569,7 @@ class FrameWriter(threading.Thread):
         self.out_dir = out_dir
         self.index_path = index_path
         self.ext = ext
+        self.params = png_params(ext)
         self.written = 0
         self.error = None
 
@@ -498,7 +584,7 @@ class FrameWriter(threading.Thread):
                         break
                     t, data, event, k = item
                     fname = f'e{event:03d}_{k:04d}{self.ext}'
-                    cv2.imwrite(str(self.out_dir / fname), data)
+                    cv2.imwrite(str(self.out_dir / fname), data, self.params)
                     idx.write(f'{t:.6f},{event},{fname}\n')
                     self.written += 1
                     if self.written % 20 == 0:
@@ -509,10 +595,86 @@ class FrameWriter(threading.Thread):
             print(self.error)
 
 
+class ContinuousWriterPool:
+    """N threads draining one bounded queue.  Shared index file under a lock.
+
+    Filenames are p<phase>_<k>, so sort by filename (not by index row) to get
+    frames in order.
+    """
+
+    def __init__(self, in_queue, out_dir, index_path, n_threads=CONT_WRITERS,
+                 ext=CONT_FMT):
+        self.in_queue = in_queue
+        self.out_dir = out_dir
+        self.index_path = index_path
+        self.n_threads = max(1, n_threads)
+        self.ext = ext
+        self.params = png_params(ext)
+        self._idx = None
+        self._idx_lock = threading.Lock()
+        self._threads = []
+        self.written = 0
+        self.error = None
+
+    def start(self):
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._idx = open(self.index_path, 'w')
+        self._idx.write('time,phase,filename\n')
+        for i in range(self.n_threads):
+            th = threading.Thread(target=self._run, daemon=True,
+                                  name=f'cont_writer_{i}')
+            th.start()
+            self._threads.append(th)
+
+    def _run(self):
+        try:
+            while True:
+                item = self.in_queue.get()
+                if item is None:
+                    break
+                t, data, phase, k = item
+                if CONT_SIZE is not None:
+                    data = cv2.resize(data, CONT_SIZE,
+                                      interpolation=cv2.INTER_AREA)
+                if CONT_8BIT and data.dtype == np.uint16:
+                    data = (data >> 8).astype(np.uint8)
+                fname = f'p{phase:03d}_{k:06d}{self.ext}'
+                path = str(self.out_dir / fname)
+                if self.ext == '.npy':
+                    np.save(path, data)
+                else:
+                    cv2.imwrite(path, data, self.params)
+                with self._idx_lock:
+                    if self._idx is not None:
+                        self._idx.write(f'{t:.6f},{phase},{fname}\n')
+                        self.written += 1
+                        if self.written % 50 == 0:
+                            self._idx.flush()
+        except Exception:
+            self.error = traceback.format_exc()
+            print(f'[cont] writer error:\n{self.error}')
+
+    def finish(self, timeout=300):
+        """Drain the backlog, stop the threads, close the index."""
+        backlog = self.in_queue.qsize()
+        if backlog:
+            print(f'[cont] draining {backlog} queued frames...')
+        for _ in self._threads:
+            self.in_queue.put(None)     # blocks if full; writers are draining
+        for th in self._threads:
+            th.join(timeout=timeout)
+        with self._idx_lock:
+            if self._idx is not None:
+                self._idx.flush()
+                self._idx.close()
+                self._idx = None
+        print(f'[cont] {self.written} continuous frames written')
+
+
 # ------------------------------------------------------------ light cycle
 
 class LightSequencer:
-    """lamp A -> blip -> dark -> lamp B -> blip -> dark -> ...
+    """lamp A -> blip -> linger -> dark (ZCHK) -> lamp B -> blip -> ...
 
     Driven entirely from the Tk event loop, so there is no extra thread and
     the relay serial port stays owned by the main thread.
@@ -534,7 +696,7 @@ class LightSequencer:
         self.state = 'idle'
         self._cancel()
         self.app.trigger.disarm()
-        self.app.flir_caching(False)
+        self.app.flir_caching_off_all()
 
     def _cancel(self):
         if self._job is not None:
@@ -542,14 +704,18 @@ class LightSequencer:
             self._job = None
 
     def _begin_light(self):
-        """Turn on the next lamp, arm the detector, start caching frames."""
+        """Turn on the next lamp, arm the detector, start caching."""
         self._cancel()
         if not self.running:
             return
-        self.state = f'lamp {LAMP_CMDS[self.lamp_i].upper()}'
-        self.app.send_relay(LAMP_CMDS[self.lamp_i], from_auto=True)
+        # reset charge baseline at the end of the dark period
+        if self.app.acq_thread is not None:
+            self.app.acq_thread.cmd_queue.put(ZCHK_CMD)
+        lamp = LAMP_CMDS[self.lamp_i]
+        self.state = f'lamp {lamp.upper()}'
+        self.app.send_relay(lamp, from_auto=True)   # also toggles cont save
         self.app.trigger.arm()
-        self.app.flir_caching(True)
+        self.app.flir_caching_for_lamp(lamp)
         if LIGHT_MAX_S:
             self._job = self.app.root.after(int(LIGHT_MAX_S * 1000),
                                             self._light_timeout)
@@ -577,7 +743,8 @@ class LightSequencer:
     def _begin_dark(self):
         self._cancel()
         self.app.trigger.disarm()
-        self.app.send_relay(LAMPS_OFF_CMD, from_auto=True)
+        self.app.send_relay(LAMPS_OFF_CMD, from_auto=True)  # stops cont save
+
         # caching is cleared by the camera itself once it has flushed
         self.lamp_i = (self.lamp_i + 1) % len(LAMP_CMDS)
         self.state = f'dark ({DARK_S / 60:.0f} min)'
@@ -588,14 +755,15 @@ class LightSequencer:
 
 class ElectrometerApp:
 
+    # Camera A = Spinnaker index 0, camera B = index 1.
+
     def __init__(self, root):
         self.root = root
-        self.root.title('Electrometer (Charge) + FLIR - automated lights')
+        self.root.title(f'Electrometer + dual FLIR - TEST: cam A '
+                        f'{CONT_FPS} fps while lamp {CONT_LAMP.upper()} on')
 
         self.acq_thread = None
         self.data_queue = None
-        self.writer = None
-        self.save_queue = None
         self.recording = False
         self.t_vec = []
         self.q_vec = []
@@ -603,9 +771,23 @@ class ElectrometerApp:
         self.events_path = None
         self.blip_n = 0
         self.last_lamp = '-'
+        self.lamp_state = 'o'           # what we last told the relay
 
         self.trigger = ChargeTrigger()
         self.sequencer = LightSequencer(self)
+
+        # --- per-camera save infrastructure ---
+        self.save_queue_a = None
+        self.save_queue_b = None
+        self.writer_a = None
+        self.writer_b = None
+
+        # --- continuous save (cam A) ---
+        self.cont_queue = None
+        self.cont_pool = None
+        self.cont_phase = 0
+
+        self._active_cams = []
 
         # --- Arduino relay connection ---
         self.relay_ser = None
@@ -657,7 +839,7 @@ class ElectrometerApp:
         ttk.Label(relay_frame, textvariable=self.relay_var).pack(side=tk.LEFT,
                                                                  padx=6)
 
-        # --- body: plot left, preview right ---
+        # --- body: plot left, previews right ---
         body = ttk.Frame(root)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -675,27 +857,136 @@ class ElectrometerApp:
         cam_panel = ttk.Frame(body, padding=4)
         cam_panel.pack(side=tk.RIGHT, fill=tk.Y)
 
-        frame = ttk.LabelFrame(cam_panel, text='flir', padding=4)
-        frame.pack(side=tk.TOP, fill=tk.X, pady=4)
-        self.cam_label = tk.Label(frame, background='#222')
+        # --- camera A preview ---
+        frame_a = ttk.LabelFrame(cam_panel,
+                                 text=f'Camera A ({CONT_FPS} fps save while '
+                                      f'lamp {CONT_LAMP.upper()} on)',
+                                 padding=4)
+        frame_a.pack(side=tk.TOP, fill=tk.X, pady=4)
+        self.cam_label = tk.Label(frame_a, background='#222')
         self.cam_label.pack()
-        self.cam_status_var = tk.StringVar(value='FLIR disabled')
-        ttk.Label(frame, textvariable=self.cam_status_var).pack(anchor='w')
+        self.cam_status_var = tk.StringVar(value='cam A disabled')
+        ttk.Label(frame_a, textvariable=self.cam_status_var).pack(anchor='w')
+
+        # --- camera B preview ---
+        frame_b = ttk.LabelFrame(cam_panel, text='Camera B', padding=4)
+        frame_b.pack(side=tk.TOP, fill=tk.X, pady=4)
+        self.cam2_label = tk.Label(frame_b, background='#222')
+        self.cam2_label.pack()
+        self.cam2_status_var = tk.StringVar(value='cam B disabled')
+        ttk.Label(frame_b, textvariable=self.cam2_status_var).pack(anchor='w')
 
         self.auto_status_var = tk.StringVar(value='automation idle')
         ttk.Label(cam_panel, textvariable=self.auto_status_var).pack(
             anchor='w', pady=4)
         ttk.Label(cam_panel,
                   text=f'ring buffer {CACHE_FRAMES} frames '
-                       f'(~{cache_ram_mb():.0f} MB)').pack(anchor='w')
+                       f'(~{cache_ram_mb():.0f} MB each, '
+                       f'~{cache_ram_mb() * 2:.0f} MB total)').pack(anchor='w')
 
-        self.cam = None
-        if FLIR_ENABLED and HAS_PYSPIN:
-            self.cam = SpinnakerCamera('flir')
-            self.cam.start()
+        self.cam = None       # camera A
+        self.cam2 = None      # camera B
+        self._spin_system = None
+        self._spin_cam_list = None
+        self._spin_cams = []          # keep refs alive
+
+        if (FLIR_ENABLED or FLIR2_ENABLED) and HAS_PYSPIN:
+            try:
+                self._spin_system = PySpin.System.GetInstance()
+                self._spin_cam_list = self._spin_system.GetCameras()
+                n = self._spin_cam_list.GetSize()
+                print(f'[spinnaker] {n} camera(s) found')
+
+                for i in range(n):
+                    c = self._spin_cam_list[i]
+                    c.Init()
+                    nm = c.GetTLDeviceNodeMap()
+                    sn = PySpin.CStringPtr(
+                        nm.GetNode('DeviceSerialNumber')).GetValue()
+                    model = PySpin.CStringPtr(
+                        nm.GetNode('DeviceModelName')).GetValue()
+                    print(f'  [{i}] {model}  S/N {sn}')
+                    self._spin_cams.append(c)
+
+                if FLIR_ENABLED and len(self._spin_cams) >= 1:
+                    self.cam = SpinnakerCamera('cam_a',
+                                              pyspin_cam=self._spin_cams[0])
+                    self.cam.start()
+
+                if FLIR2_ENABLED and len(self._spin_cams) >= 2:
+                    self.cam2 = SpinnakerCamera('cam_b',
+                                               pyspin_cam=self._spin_cams[1])
+                    self.cam2.start()
+                elif FLIR2_ENABLED:
+                    print('[spinnaker] only 1 camera found, cam_b disabled')
+            except Exception as e:
+                print(f'[spinnaker] init error: {e}')
 
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         self.root.after(PREVIEW_MS, self._update_previews)
+
+    # ---------- dual-camera helpers ----------
+
+    def _opposite_cam(self, lamp_cmd):
+        """Return the camera on the opposite side of the given lamp."""
+        if lamp_cmd == 'a':
+            return self.cam2
+        elif lamp_cmd == 'b':
+            return self.cam
+        return None
+
+    def flir_caching_for_lamp(self, lamp_cmd):
+        """Start caching on the camera(s) for this light phase."""
+        if CACHE_BOTH_CAMS:
+            self.flir_caching_both()
+            return
+        self.flir_caching_off_all()
+        opp = self._opposite_cam(lamp_cmd)
+        if opp is not None and opp.is_alive() and opp.error is None:
+            opp.caching.set()
+            self._active_cams = [opp]
+        else:
+            self._active_cams = []
+
+    def flir_caching_both(self):
+        """Cache on all available cameras."""
+        self._active_cams = []
+        for c in (self.cam, self.cam2):
+            if c is not None and c.is_alive() and c.error is None:
+                c.caching.set()
+                self._active_cams.append(c)
+
+    def flir_caching_off_all(self):
+        """Stop caching on all cameras."""
+        for c in (self.cam, self.cam2):
+            if c is not None:
+                c.caching.clear()
+        self._active_cams = []
+
+    def flir_burst_active(self, event_n):
+        """Burst-dump whichever camera(s) are actively caching."""
+        for c in self._active_cams:
+            c.burst(event_n)
+
+    # ---------- continuous save control ----------
+
+    def _set_cont(self, on):
+        """Turn cam A's continuous 20 fps save on/off.  Called on every
+        relay write, so it tracks the lamp exactly - auto or manual."""
+        cam = self.cam
+        if not CONT_ENABLED or cam is None or cam.cont_queue is None:
+            return
+        if on and self.recording:
+            if not cam.cont_active.is_set():
+                self.cont_phase += 1
+                cam.cont_set(True, self.cont_phase)
+                print(f'[cont] phase {self.cont_phase}: cam A saving at '
+                      f'{FLIR_FPS / CONT_EVERY:.0f} fps')
+        elif cam.cont_active.is_set():
+            cam.cont_set(False)
+            print(f'[cont] phase {self.cont_phase} stopped '
+                  f'({cam.cont_queued} queued, {cam.cont_dropped} dropped '
+                  f'so far)')
 
     # ---------- things the sequencer calls ----------
 
@@ -715,34 +1006,29 @@ class ElectrometerApp:
             return
         try:
             self.relay_ser.write(cmd.encode())
+            self.lamp_state = cmd
             labels = {'a': 'Lamp A ON', 'b': 'Lamp B ON', 'o': 'Both OFF'}
             self.relay_var.set(labels.get(cmd, cmd))
         except Exception as e:
             self.relay_var.set(f'error: {e}')
             print(f'[relay] write error: {e}')
-
-    def flir_caching(self, on):
-        if self.cam is None:
             return
-        if on:
-            self.cam.caching.set()
-        else:
-            self.cam.caching.clear()
 
-    def flir_burst(self, event_n):
-        if self.cam is not None:
-            self.cam.burst(event_n)
+        self._set_cont(cmd == CONT_LAMP)
 
     def on_blip(self, t):
-        """A blip fired.  Dump the frame buffer either way; only the
-        automation reacts by changing the lights."""
+        """A blip fired.  Dump the frame buffer(s); only the automation
+        reacts by changing the lights."""
         self.blip_n += 1
         lamp = self.sequencer.lamp() if self.sequencer.running else self.last_lamp
-        n_frames = self.cam.cache_len() if self.cam else 0
-        self.flir_burst(self.blip_n)
-        self._log_event(self.blip_n, t, lamp, n_frames)
+
+        n_frames = sum(c.cache_len() for c in self._active_cams)
+        rec_names = ','.join(c.cam_name for c in self._active_cams) or '-'
+
+        self.flir_burst_active(self.blip_n)
+        self._log_event(self.blip_n, t, lamp, rec_names, n_frames)
         print(f'[blip] {self.blip_n} at t={t:.2f} s, lamp {lamp}, '
-              f'{n_frames} frames')
+              f'rec {rec_names}, {n_frames} frames')
 
         if self.sequencer.running:
             self.sequencer.advance()        # lights off, dark, then next lamp
@@ -750,15 +1036,15 @@ class ElectrometerApp:
             self._begin_manual()            # keep watching, leave lamps alone
 
     def _begin_manual(self):
-        """Arm the detector and the ring buffer without touching the lamps."""
+        """Arm the detector and both ring buffers without touching the lamps."""
         self.trigger.arm()
-        self.flir_caching(True)
+        self.flir_caching_both()
 
-    def _log_event(self, n, t, lamp, n_frames):
+    def _log_event(self, n, t, lamp, rec_cam, n_frames):
         if self.events_path is None:
             return
         with open(self.events_path, 'a') as f:
-            f.write(f'{n},{t:.3f},{lamp},{n_frames}\n')
+            f.write(f'{n},{t:.3f},{lamp},{rec_cam},{n_frames}\n')
 
     def _on_auto_toggle(self):
         if self.auto_var.get():
@@ -786,43 +1072,81 @@ class ElectrometerApp:
 
         with open(self.session_dir / 'meta.txt', 'w') as f:
             f.write(f'wall_clock_start\t{datetime.now().isoformat()}\n')
+            f.write('script\tTEST cont20 variant\n')
             f.write(f'serial_port\t{SERIAL_PORT}\n')
             f.write(f'relay_port\t{RELAY_PORT}\n')
             f.write(f'delay_ms\t{DELAY_MS}\n')
             f.write('mode\tcharge\n')
             f.write(f'charge_rise_pC\t{CHARGE_RISE_PC}\n')
+            f.write(f'jump_pC\t{JUMP_PC}\n')
             f.write(f'trigger_window_s\t{TRIGGER_WINDOW_S}\n')
             f.write(f'dark_s\t{DARK_S}\n')
+            f.write(f'light_linger_s\t{LIGHT_LINGER_S}\n')
             f.write(f'light_max_s\t{LIGHT_MAX_S}\n')
             f.write(f'automation\t{self.auto_var.get()}\n')
             f.write(f'flir_enabled\t{FLIR_ENABLED}\n')
-            if FLIR_ENABLED:
+            f.write(f'flir2_enabled\t{FLIR2_ENABLED}\n')
+            f.write(f'cache_both_cams\t{CACHE_BOTH_CAMS}\n')
+            if FLIR_ENABLED or FLIR2_ENABLED:
                 f.write(f'flir_fps\t{FLIR_FPS}\n')
                 f.write(f'flir_roi\t{FLIR_ROI}\n')
                 f.write(f'flir_mono16\t{FLIR_MONO16}\n')
                 f.write(f'cache_seconds\t{CACHE_SECONDS}\n')
                 f.write(f'cache_frames\t{CACHE_FRAMES}\n')
                 f.write(f'post_roll_s\t{POST_ROLL_S}\n')
+                f.write(f'png_level\t{PNG_LEVEL}\n')
+            f.write(f'cont_enabled\t{CONT_ENABLED}\n')
+            if CONT_ENABLED:
+                f.write(f'cont_lamp\t{CONT_LAMP}\n')
+                f.write(f'cont_fps\t{FLIR_FPS / CONT_EVERY}\n')
+                f.write(f'cont_every\t{CONT_EVERY}\n')
+                f.write(f'cont_writers\t{CONT_WRITERS}\n')
+                f.write(f'cont_queue_max\t{CONT_QUEUE_MAX}\n')
+                f.write(f'cont_fmt\t{CONT_FMT}\n')
+                f.write(f'cont_size\t{CONT_SIZE}\n')
+                f.write(f'cont_8bit\t{CONT_8BIT}\n')
 
         self.events_path = self.session_dir / 'events.csv'
         with open(self.events_path, 'w') as f:
-            f.write('event,time,lamp,frames\n')
+            f.write('event,time,lamp,rec_cam,frames\n')
 
-        self.writer = None
-        self.save_queue = None
-        if self.cam is not None and self.cam.error is None \
-                and self.cam.is_alive():
-            # Unbounded: a burst is handed over in one go and must not drop.
-            self.save_queue = queue.Queue()
-            self.writer = FrameWriter(
-                self.save_queue,
-                self.session_dir / 'flir',
-                self.session_dir / 'flir_frames.csv',
+        # --- per-camera burst writers ---
+        self.save_queue_a = None
+        self.save_queue_b = None
+        self.writer_a = None
+        self.writer_b = None
+
+        def _arm_cam(cam, label, subdir, index_csv):
+            if cam is None or cam.error is not None or not cam.is_alive():
+                if cam is not None:
+                    print(f'[{label}] not recording (dead or errored)')
+                return None, None
+            sq = queue.Queue()
+            w = FrameWriter(sq,
+                            self.session_dir / subdir,
+                            self.session_dir / index_csv)
+            w.start()
+            cam.arm(sq, t0)
+            return sq, w
+
+        self.save_queue_a, self.writer_a = _arm_cam(
+            self.cam, 'cam_a', 'flir_a', 'flir_a_frames.csv')
+        self.save_queue_b, self.writer_b = _arm_cam(
+            self.cam2, 'cam_b', 'flir_b', 'flir_b_frames.csv')
+
+        # --- continuous writer pool for cam A ---
+        self.cont_queue = None
+        self.cont_pool = None
+        self.cont_phase = 0
+        if CONT_ENABLED and self.save_queue_a is not None:
+            self.cont_queue = queue.Queue(maxsize=CONT_QUEUE_MAX)
+            self.cont_pool = ContinuousWriterPool(
+                self.cont_queue,
+                self.session_dir / 'flir_a_cont',
+                self.session_dir / 'flir_a_cont_frames.csv',
             )
-            self.writer.start()
-            self.cam.arm(self.save_queue, t0)
-        elif self.cam is not None:
-            print('[flir] not recording (dead or errored)')
+            self.cont_pool.start()
+            self.cam.cont_arm(self.cont_queue)
 
         self.trigger.disarm()
         self.blip_n = 0
@@ -844,6 +1168,8 @@ class ElectrometerApp:
             self.sequencer.start()
         else:
             self._begin_manual()
+            # lamp A may already be on from a manual press before Start
+            self._set_cont(self.lamp_state == CONT_LAMP)
 
         self.root.after(50, self._poll_queue)
 
@@ -851,36 +1177,52 @@ class ElectrometerApp:
         self.recording = False
         self.sequencer.stop()
         self.send_relay(LAMPS_OFF_CMD, from_auto=True)
+        self._set_cont(False)           # in case the relay write failed
 
         if self.acq_thread is not None:
             self.acq_thread.stop()
             self.acq_thread.join(timeout=6)
 
-        self._finish_writer()
+        self._finish_writers()
 
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
 
         good = int(np.count_nonzero(~np.isnan(self.q_vec))) \
             if self.q_vec else 0
-        frames = self.cam.saved if self.cam else 0
+        frames_a = self.cam.saved if self.cam else 0
+        frames_b = self.cam2.saved if self.cam2 else 0
+        cont = (f', cont {self.cam.cont_queued} saved/'
+                f'{self.cam.cont_dropped} dropped') if self.cam else ''
         self.status_var.set(
             f'Stopped. {good}/{len(self.q_vec)} valid readings, '
-            f'{self.blip_n} blips, {frames} frames '
+            f'{self.blip_n} blips, {frames_a}+{frames_b} burst frames{cont} '
             f'-> {self.session_dir.name}'
         )
 
-    def _finish_writer(self):
-        """Let the camera hand over anything queued, then close the writer."""
+    def _finish_writers(self):
+        """Let the cameras hand over anything queued, then close writers."""
+        self.flir_caching_off_all()
         if self.cam is not None:
-            self.cam.caching.clear()
+            self.cam.cont_set(False)
         time.sleep(0.2)
-        if self.save_queue is not None:
-            self.save_queue.put(None)
-        if self.writer is not None:
-            self.writer.join(timeout=120)
-        self.save_queue = None
-        self.writer = None
+
+        for sq, w in ((self.save_queue_a, self.writer_a),
+                      (self.save_queue_b, self.writer_b)):
+            if sq is not None:
+                sq.put(None)
+            if w is not None:
+                w.join(timeout=120)
+
+        if self.cont_pool is not None:
+            self.cont_pool.finish()
+        if self.cam is not None:
+            self.cam.cont_queue = None
+
+        self.save_queue_a = self.save_queue_b = None
+        self.writer_a = self.writer_b = None
+        self.cont_queue = None
+        self.cont_pool = None
 
     # ---------- queue draining / live plot ----------
 
@@ -918,16 +1260,20 @@ class ElectrometerApp:
             self.ax.autoscale_view(scalex=False)
             self.canvas.draw_idle()
 
-            frames = self.cam.saved if self.cam else 0
+            frames_a = self.cam.saved if self.cam else 0
+            frames_b = self.cam2.saved if self.cam2 else 0
+            cont = self.cam.cont_queued if self.cam else 0
             self.status_var.set(
                 f'Recording -> {self.session_dir.name}  '
                 f'({len(self.t_vec)} samples, '
-                f'{self.blip_n} blips, {frames} frames)'
+                f'{self.blip_n} blips, {frames_a}+{frames_b} burst, '
+                f'{cont} cont)'
             )
 
         if ended:
             self.recording = False
             self.sequencer.stop()
+            self._set_cont(False)
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
             if self.acq_thread.error:
@@ -952,6 +1298,18 @@ class ElectrometerApp:
                 self.cam_label.image = photo
             self.cam_status_var.set(self.cam.status_line())
 
+        if self.cam2 is not None:
+            rgb2 = self.cam2.latest_frame_rgb()
+            if rgb2 is not None:
+                h, w = rgb2.shape[:2]
+                new_h = max(1, int(h * PREVIEW_W / w))
+                small = cv2.resize(rgb2, (PREVIEW_W, new_h),
+                                   interpolation=cv2.INTER_AREA)
+                photo2 = ImageTk.PhotoImage(Image.fromarray(small))
+                self.cam2_label.configure(image=photo2)
+                self.cam2_label.image = photo2
+            self.cam2_status_var.set(self.cam2.status_line())
+
         if self.sequencer.running:
             self.auto_status_var.set(
                 f'automation: {self.sequencer.state}  '
@@ -964,13 +1322,28 @@ class ElectrometerApp:
     def _on_close(self):
         self.recording = False
         self.sequencer.stop()
+        self._set_cont(False)
         if self.acq_thread is not None and self.acq_thread.is_alive():
             self.acq_thread.stop()
             self.acq_thread.join(timeout=6)
-        self._finish_writer()
+        self._finish_writers()
         if self.cam is not None:
             self.cam.stop()
             self.cam.join(timeout=3)
+        if self.cam2 is not None:
+            self.cam2.stop()
+            self.cam2.join(timeout=3)
+        # Spinnaker teardown: DeInit in reverse, then clear, then release
+        for c in reversed(self._spin_cams):
+            try:
+                c.DeInit()
+            except Exception:
+                pass
+        self._spin_cams.clear()
+        if self._spin_cam_list is not None:
+            self._spin_cam_list.Clear()
+        if self._spin_system is not None:
+            self._spin_system.ReleaseInstance()
         if self.relay_ser is not None:
             try:
                 self.relay_ser.write(LAMPS_OFF_CMD.encode())
@@ -981,8 +1354,14 @@ class ElectrometerApp:
 
 
 if __name__ == '__main__':
+    per_cam = cache_ram_mb()
     print(f'[cache] {CACHE_FRAMES} frames @ {FLIR_FPS} fps = {CACHE_SECONDS} s'
-          f', ~{cache_ram_mb():.0f} MB RAM')
+          f', ~{per_cam:.0f} MB/cam, ~{per_cam * 2:.0f} MB total')
+    if CONT_ENABLED:
+        print(f'[cont] cam A every {CONT_EVERY} frames '
+              f'(~{FLIR_FPS / CONT_EVERY:.0f} fps) while lamp '
+              f'{CONT_LAMP.upper()} is on, {CONT_WRITERS} writers, '
+              f'queue {CONT_QUEUE_MAX}, {CONT_FMT}')
     root = tk.Tk()
     app = ElectrometerApp(root)
     root.mainloop()

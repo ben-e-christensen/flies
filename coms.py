@@ -21,7 +21,7 @@ IS_LINUX = platform.system() == 'Linux'
 # Windows: bare COM numbers (or a full 'COM12' string if you prefer).
 WINDOWS_PORTS = {
     'arduino':  5,
-    'keithley': 6,
+    'keithley': 8,
 }
 
 # Linux: device paths for the same instruments.
