@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+.venv312/
+venv/
+env/
+
+# Acquisition output (large; lives on the data drive)
+Kiethley_data/
+Kiethley_data_old/
+cam_data/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
