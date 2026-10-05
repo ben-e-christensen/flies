@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Turn a capture.py session into two MP4s laid out like main.py: camera on the
-left, the 3 ADC traces on the right covering the whole clip, with a red cursor
+left, the ADC traces on the right covering the whole clip, with a red cursor
 at the current frame's time. One video shows the raw traces, the other the
 same traces with 60 Hz mains hum (and harmonics) removed (see filters.py).
 
@@ -31,9 +31,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from scope_panel import CHANNEL_NAMES, COLORS, PLOT_ORDER
-from sync import adc_times, frame_times
-from filters import notch_mains
+from channels import channel_info, n_channels, read_meta
+from sync import adc_times, frame_times, LEGACY_ADS_DELAY_S
+from filters import remove_mains
 
 CAPTURES = Path(__file__).resolve().parent / "captures"
 
@@ -52,16 +52,6 @@ def newest_session():
     return sessions[-1]
 
 
-def read_meta(session):
-    meta = {}
-    p = session / "meta.txt"
-    if p.exists():
-        for line in p.read_text().splitlines():
-            k, _, v = line.partition("\t")
-            meta[k] = v
-    return meta
-
-
 def load_times(session, fmeta, adc):
     """Synced frame and ADC times. Uses the `t` columns when capture.py wrote them."""
     if "t" in fmeta.dtype.names and "t" in adc.dtype.names:
@@ -69,7 +59,7 @@ def load_times(session, fmeta, adc):
     print("[!] capture predates clock sync: using approximate alignment (~1 ms)")
     exposure_us = float(read_meta(session).get("exposure_us", 3000))
     return (frame_times(fmeta["cam_t"], exposure_us, host_t=fmeta["host_t"]),
-            adc_times(adc["esp_t"], adc["host_t"]))
+            adc_times(adc["esp_t"], adc["host_t"], LEGACY_ADS_DELAY_S))  # pre-sync = ADS board
 
 
 def filtered_traces(session, t_adc, v):
@@ -80,22 +70,23 @@ def filtered_traces(session, t_adc, v):
         if len(b) and "t" in b.dtype.names:
             n_b = len(b)
             t_all = np.concatenate([b["t"], t_adc])
-            return [notch_mains(t_all, np.concatenate([b[f"v{i}"], v[i]]))[n_b:]
-                    for i in range(3)]
-    return [notch_mains(t_adc, y) for y in v]
+            return [remove_mains(t_all, np.concatenate([b[f"v{i}"], v[i]]))[n_b:]
+                    for i in range(len(v))]
+    return [remove_mains(t_adc, y) for y in v]
 
 
-def render_plot_panel(t_adc, v, t0, t1, height):
+def render_plot_panel(t_adc, v, t0, t1, height, chans):
     """Draw the ADC traces for [t0, t1] once. Returns the BGR image, a function
     mapping time -> x pixel, and each axes' (top, bottom) pixel rows."""
     dpi = 100
-    fig, axes = plt.subplots(3, 1, sharex=True, dpi=dpi, figsize=(PLOT_W / dpi, height / dpi))
+    fig, axes = plt.subplots(len(v), 1, sharex=True, dpi=dpi, figsize=(PLOT_W / dpi, height / dpi))
     fig.subplots_adjust(left=0.12, right=0.98, top=0.97, bottom=0.08, hspace=0.12)
     sel = (t_adc >= t0) & (t_adc <= t1)
     few = np.count_nonzero(sel) < 60
-    for ax, i in zip(axes, PLOT_ORDER):
-        ax.plot(t_adc[sel], v[i][sel] * 1e3, color=COLORS[i], lw=1, marker="." if few else None)
-        ax.set_ylabel(f"{CHANNEL_NAMES[i].split(' (')[0]}\nmV", fontsize=8)
+    names, colors, order = chans
+    for ax, i in zip(axes, order):
+        ax.plot(t_adc[sel], v[i][sel] * 1e3, color=colors[i], lw=1, marker="." if few else None)
+        ax.set_ylabel(f"{names[i].split(' (')[0]}\nmV", fontsize=8)
         ax.tick_params(labelsize=7)
         ax.grid(True, alpha=0.3)
     axes[0].set_xlim(t0, t1)
@@ -138,7 +129,10 @@ def main():
         sys.exit(f"Frames must satisfy 0 <= start <= end <= {n - 1} (got {start}, {end})")
 
     t_frame, t_adc = load_times(session, fmeta, adc)
-    v = [adc[f"v{i}"] for i in range(3)]
+    n_ch = n_channels(adc.dtype.names)
+    v = [adc[f"v{i}"] for i in range(n_ch)]
+    chans = channel_info(n_ch, read_meta(session))
+    order = chans[2]
     cam_fps = (n - 1) / (t_frame[-1] - t_frame[0])
     out_fps = cam_fps * args.speed
 
@@ -153,7 +147,7 @@ def main():
     stem = f"video_f{start:04d}-{end:04d}_x{args.speed:g}"
     versions = []  # (tag shown on video, traces, plot image, ffmpeg process, path)
     for tag, traces in [("RAW", v), ("60 Hz FILTERED", filtered_traces(session, t_adc, v))]:
-        plot_bg, x_of, spans = render_plot_panel(t_adc, traces, t0, t1, PANEL_H)
+        plot_bg, x_of, spans = render_plot_panel(t_adc, traces, t0, t1, PANEL_H, chans)
         path = session / f"{stem}_{'raw' if tag == 'RAW' else 'filtered'}.mp4"
         ff = subprocess.Popen(
             ["ffmpeg", "-y", "-loglevel", "error",
@@ -179,7 +173,7 @@ def main():
             cv2.putText(canvas, label, (10, 28), font, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
             cv2.putText(canvas, label, (10, 28), font, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
-            for (top, bot), y in zip(spans, [traces[j] for j in PLOT_ORDER]):
+            for (top, bot), y in zip(spans, [traces[j] for j in order]):
                 cv2.line(canvas, (x, top), (x, bot), (0, 0, 220), 1, cv2.LINE_AA)
                 val = np.interp(t, t_adc, y) * 1e3
                 cv2.rectangle(canvas, (out_w - 116, top + 2), (out_w - 22, top + 22),

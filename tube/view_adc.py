@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot the 3 electrometer channels from a capture.py session.
+"""Plot the electrometer channels from a capture.py session.
 
     python3 view_adc.py                                  # newest session in captures/
     python3 view_adc.py captures/session_2026-09-29_16-39-46
@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from scope_panel import CHANNEL_NAMES, COLORS, PLOT_ORDER
+from channels import channel_info, n_channels, read_meta
 
 CAPTURES = Path(__file__).resolve().parent / "captures"
 
@@ -52,10 +52,13 @@ def main():
     d = np.genfromtxt(csv, delimiter=",", names=True)
     t = d["t"] if "t" in d.dtype.names else d["host_t"]  # older captures lack t
 
-    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 7), layout="constrained")
+    n_ch = n_channels(d.dtype.names)
+    names, colors, order = channel_info(n_ch, read_meta(session))
+    fig, axes = plt.subplots(n_ch, 1, sharex=True, figsize=(11, 2 + 1.6 * n_ch),
+                             layout="constrained")
     fig.suptitle(f"{session.name}{'  NOISE FLOOR' if args.baseline else ''}   ({len(t)} samples, {len(t) / (t[-1] - t[0]):.0f} S/s)")
-    for ax, i in zip(axes, PLOT_ORDER):
-        name, color = CHANNEL_NAMES[i], COLORS[i]
+    for ax, i in zip(axes, order):
+        name, color = names[i], colors[i]
         y = d[f"raw{i}"] if args.raw else d[f"v{i}"]
         ax.plot(t, y, color=color, lw=0.7, alpha=0.5 if args.smooth else 1)
         if args.smooth > 1:

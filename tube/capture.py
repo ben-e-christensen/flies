@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Burst capture: ADC (3 channels) + Basler frames into RAM, then save to disk.
+"""Burst capture: ADC (MAX1032, 4 channels, ~17.9 kHz each) + Basler frames
+into RAM, then save to disk.
 
 First records a noise floor: --baseline seconds (default 10) of ADC only,
 camera idle. Then the capture itself (ADC + camera) starts; that's when to
@@ -8,10 +9,12 @@ drop. Nothing touches the disk until the end.
     python3 capture.py                     # 10 s baseline, then 10 s at 100 fps
     python3 capture.py -d 5 --fps 200 --exposure 2000
     python3 capture.py --baseline 0        # skip the noise floor
+    python3 capture.py --rate 10000        # ADC samples/s per channel (default: board max)
+    python3 capture.py --range 6           # ADC input range +/-6.144 V (default +/-12.288 V)
 
 Output: captures/session_<timestamp>/
     baseline.csv  noise floor, same columns as adc.csv, t from -baseline to 0
-    adc.csv       t,host_t,esp_t,raw0,raw1,raw2,v0,v1,v2
+    adc.csv       t,host_t,esp_t,raw0..raw3,v0..v3  (raw = 14-bit codes, 8192 = 0 V)
     frames.npy    (n_frames, H, W) uint8.  np.load(p, mmap_mode='r') to browse
     frames.csv    index,t,host_t,cam_t,block_id
     meta.txt      key<TAB>value settings + capture stats
@@ -20,7 +23,8 @@ All ADC data is saved raw (counts and unfiltered volts).
 
 t        synced time (s since the capture started) -- use this to line up
          frames with ADC samples. Frame t = middle of its exposure. See sync.py.
-host_t   when the host received it (includes USB/readout delay, ~8 ms for frames)
+host_t   when the host received it (includes USB/readout delay, ~8 ms for
+         frames; ADC samples arrive in blocks, so it's the block's arrival)
 esp_t / cam_t   each device's own clock
 
 Close main.py first. Only one program can have the camera open.
@@ -35,12 +39,16 @@ from pathlib import Path
 import numpy as np
 from pypylon import pylon
 
-from adc_serial import AdcReader, ADS_FSR_V
+from adc_serial import AdcReader
+from channels import CHANNEL_NAMES, PLOT_ORDER
 from sync import cam_clock_offset, adc_times, frame_times
 
 # ============ CONFIG ============
 DURATION_S = 10.0
 BASELINE_S = 10.0       # ADC-only noise floor recorded before the capture
+ADC_RATE = None         # samples/s per channel; None = the board's default (its max,
+                        # ~17.9 kHz measured with 4 channels)
+ADC_RANGE_V = 12        # +/- volts: 3, 6 or 12 (MAX1032 +/-3.072, 6.144, 12.288 V)
 FPS = 100.0
 EXPOSURE_US = None      # None = keep camera's value (clamped to fit the frame period)
 GAIN_DB = 28.0          # same as basler_feed.py
@@ -85,13 +93,13 @@ def open_camera(fps, exposure_us):
     return cam
 
 
-def noise_floor_stats(base, t_base):
+def noise_floor_stats(base, t_base, n_ch):
     """Quick summary of the baseline per channel (mV at the electrometer):
     overall std, and the 60 Hz component's amplitude."""
     fs = (len(t_base) - 1) / (t_base[-1] - t_base[0])
     std, hum = [], []
-    for i in range(3):
-        v = base[:, 5 + i] * 1e3
+    for i in range(n_ch):
+        v = base[:, 2 + n_ch + i] * 1e3
         v = v[np.isfinite(v)]
         std.append(f"v{i}={np.std(v):.2f}")
         spec = np.abs(np.fft.rfft(v - v.mean())) * 2 / len(v)
@@ -114,6 +122,13 @@ def main():
     ap.add_argument("--baseline", type=float, default=BASELINE_S,
                     help=f"seconds of ADC-only noise floor before the capture "
                          f"(default {BASELINE_S:g}, 0 = skip)")
+    ap.add_argument("--rate", type=float, default=ADC_RATE,
+                    help="ADC samples/s per channel (default: as fast as the board "
+                         "allows, ~17.9 kHz; it caps requests at its measured max)")
+    ap.add_argument("--range", type=float, dest="range_v", default=ADC_RANGE_V,
+                    help=f"ADC input range +/- volts: 3, 6 or 12 (default {ADC_RANGE_V:g}). "
+                         "Wider avoids clipping, narrower gives finer steps "
+                         "(1.5 mV / 750 uV / 375 uV per count)")
     ap.add_argument("--port", help="ESP32 serial port (default: auto-detect)")
     ap.add_argument("--no-camera", action="store_true", help="ADC only")
     args = ap.parse_args()
@@ -134,33 +149,39 @@ def main():
         frames.fill(0)  # touch the pages now so the OS doesn't allocate them mid-capture
         frame_meta = np.zeros((n_frames, 3), np.float64)  # host_t, cam_t, block_id
 
-    # rows: (host perf_counter, esp_t, raw0, raw1, raw2, v0, v1, v2);
-    # made relative to t0 (capture start) when saving
-    baseline_rows, adc_rows = [], []
+    # blocks: (host perf_counter, esp_t, raw codes, volts) as the reader
+    # delivers them; host time made relative to t0 (capture start) when saving
+    baseline_blocks, adc_blocks = [], []
     sink = [None]  # list the reader thread appends to; None = not recording
 
-    def on_sample(esp_t, v0, v1, v2, raws):
-        rows = sink[0]
-        if rows is not None:
-            rows.append((time.perf_counter(), esp_t, *raws, v0, v1, v2))
+    def on_block(host_t, esp_t, raw, volts):
+        blocks = sink[0]
+        if blocks is not None:
+            blocks.append((host_t, esp_t, raw, volts))
 
-    reader = AdcReader(args.port)
-    reader.on_sample = on_sample
+    reader = AdcReader(args.port, rate=args.rate, range_v=args.range_v)
+    reader.on_block = on_block
     reader.start()
     print(f"Waiting for ADC data on {reader.port}…")
-    deadline = time.time() + 5
-    while reader.n_samples < 50:
+    deadline = time.time() + 6
+    while reader.n_samples < reader.sample_hz * 0.2 or reader.sample_hz == 0:
         if time.time() > deadline:
             reader.stop()
             if cam:
                 cam.Close()
             sys.exit(f"No ADC data ({reader.err or 'nothing received'}).")
         time.sleep(0.05)
+    max_hz = (reader.cfg or {}).get("max_hz", 0)
+    print(f"ADC: {reader.sample_hz:g} samples/s per channel x {reader.n_ch} "
+          f"(board max {max_hz:g}), range +/-{reader.cfg['range_v']:g} V "
+          f"({reader.cfg['lsb_v'] * 1e6:g} uV per count)")
+    if args.rate and reader.sample_hz < args.rate * 0.99:
+        print(f"[!] asked for {args.rate:g}, the board can only do {reader.sample_hz:g}")
 
     # ---- noise floor ----
     if args.baseline > 0:
         print(f"Noise floor: {args.baseline:g} s of ADC only. Don't drop yet…")
-        sink[0] = baseline_rows
+        sink[0] = baseline_blocks
         b_end = time.perf_counter() + args.baseline
         try:
             while (left := b_end - time.perf_counter()) > 0:
@@ -180,7 +201,7 @@ def main():
     cam_sync = []  # (cam_s, offset) pairs; offset made relative to t0 below
     started = datetime.now()
     t0 = time.perf_counter()
-    sink[0] = adc_rows
+    sink[0] = adc_blocks
     try:
         if cam:
             cam_sync.append(cam_clock_offset(cam))
@@ -218,16 +239,23 @@ def main():
     out.mkdir(parents=True)
     print(f"Saving to {out} …")
 
-    adc = np.array(adc_rows, np.float64).reshape(-1, 8)
-    base = np.array(baseline_rows, np.float64).reshape(-1, 8)
-    adc[:, 0] -= t0
-    base[:, 0] -= t0
-    # one ESP->host clock alignment for both (same clock, more samples)
+    n_ch = reader.n_ch
+
+    def to_table(blocks):
+        """Blocks -> (n, 2 + 2*n_ch) array: host_t, esp_t, raw..., v..."""
+        if not blocks:
+            return np.empty((0, 2 + 2 * n_ch))
+        return np.vstack([np.column_stack([np.full(len(e), h - t0), e, r, v])
+                          for h, e, r, v in blocks])
+
+    adc, base = to_table(adc_blocks), to_table(baseline_blocks)
+    # one board->host clock alignment for both (same clock, more samples)
     both = np.vstack([base, adc])
     t_both = adc_times(both[:, 1], both[:, 0]) if len(both) else np.empty(0)
     t_base, t_adc = t_both[:len(base)], t_both[len(base):]
-    adc_header = "t,host_t,esp_t,raw0,raw1,raw2,v0,v1,v2"
-    adc_fmt = ["%.6f", "%.6f", "%.6f", "%d", "%d", "%d", "%.6f", "%.6f", "%.6f"]
+    adc_header = ",".join(["t", "host_t", "esp_t"] + [f"raw{i}" for i in range(n_ch)]
+                          + [f"v{i}" for i in range(n_ch)])
+    adc_fmt = ["%.6f", "%.6f", "%.6f"] + ["%d"] * n_ch + ["%.6f"] * n_ch
     np.savetxt(out / "adc.csv", np.column_stack([t_adc, adc]), delimiter=",",
                comments="", header=adc_header, fmt=adc_fmt)
     if len(base):
@@ -238,16 +266,20 @@ def main():
         "wall_clock_start": started.isoformat(timespec="milliseconds"),
         "duration_s": f"{elapsed:.3f}",
         "adc_port": reader.port,
+        "adc": "MAX1032 on XIAO ESP32-C6",
+        "adc_cfg": " ".join(f"{k}={v:g}" if isinstance(v, float) else f"{k}={v}"
+                            for k, v in (reader.cfg or {}).items()),
         "adc_samples": len(adc),
         "adc_rate_hz": f"{len(adc) / elapsed:.1f}",
-        "ads_fsr_v": ADS_FSR_V,
-        "channels": "v0=bottom ring (0x48), v1=middle ring (0x49), v2=top ring (0x4A)",
+        "channel_names": "|".join(CHANNEL_NAMES),
+        "plot_order": ",".join(str(i) for i in PLOT_ORDER),
+        "adc_gaps_total": f"{reader.n_gaps} ({reader.n_missing} samples)",
     }
     if len(adc) > 1:
         gaps = np.diff(adc[:, 1])
         stats["adc_max_gap_ms"] = f"{gaps.max() * 1e3:.2f}"
     if len(base) > 100:
-        stats.update(noise_floor_stats(base, t_base))
+        stats.update(noise_floor_stats(base, t_base, n_ch))
 
     if cam:
         fm = frame_meta[:n_got]

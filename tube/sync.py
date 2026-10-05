@@ -9,16 +9,23 @@ time is the middle of its exposure.
 Note: the arrival time of a frame is NOT usable for this. Frames reach the
 host ~8 ms after exposure starts (exposure + sensor readout + USB transfer).
 
-ADC: the ESP's clock is aligned by assuming the fastest-arriving line had
-~zero USB delay (good to ~1 ms), then shifted back ADC_DELAY_S because the
-value read at esp_t is a conversion that averaged over the previous ~1.2 ms.
+ADC: the board's clock is aligned by assuming the fastest-arriving block had
+~zero USB delay (good to ~1 ms). The MAX1032 samples at the start of each
+conversion, a few microseconds after esp_t, so no further correction is
+needed. CH1..3 are converted ~10 us after the channel before (tick_us in the
+board header); far below the 200 us sample period.
+
+The old ADS1115 board needed a 1/860 s correction (its value was a conversion
+averaged over the previous ~1.2 ms); LEGACY_ADS_DELAY_S is kept for its
+sessions.
 """
 
 import time
 
 import numpy as np
 
-ADC_DELAY_S = 1 / 860  # ADS1115 continuous @ 860 SPS: mean age of the value read
+ADC_DELAY_S = 0.0              # MAX1032: samples at the start of the conversion
+LEGACY_ADS_DELAY_S = 1 / 860   # old ADS1115 board @ 860 SPS: mean age of the value read
 
 # Only used for sessions recorded before capture.py did the latch sync:
 # measured arrival delay after exposure start = exposure + ~6 ms (acA1440-220um,
@@ -40,9 +47,9 @@ def cam_clock_offset(cam, n=20):
     return best[1], best[2]
 
 
-def adc_times(esp_t, host_t):
-    """ESP clock (s) -> host time (s)."""
-    return esp_t + np.min(host_t - esp_t) - ADC_DELAY_S
+def adc_times(esp_t, host_t, delay_s=ADC_DELAY_S):
+    """Board clock (s) -> host time (s)."""
+    return esp_t + np.min(host_t - esp_t) - delay_s
 
 
 def frame_times(cam_t_ns, exposure_us, sync=None, host_t=None):

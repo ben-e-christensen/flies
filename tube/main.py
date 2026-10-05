@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Tube rig: Basler camera + 3x ADS1115 (via ESP32-S3) in one window.
+"""Tube rig: Basler camera + MAX1032 electrometer ADC (via XIAO ESP32-C6) in one window.
 
 Runs three things at once:
-    - AdcReader thread     reads t_us,raw0,raw1,raw2 lines from the ESP32, converts to volts
+    - AdcReader thread     reads the board's binary sample stream, converts to volts
     - CameraGrabber thread pulls frames from the Basler camera
-    - Tk main loop         shows the camera (left) and the 3 traces (right)
+    - Tk main loop         shows the camera (left) and one trace per channel (right)
 
     python3 main.py                  # auto-detect the ESP32
     python3 main.py --port /dev/ttyACM1
     python3 main.py --no-camera      # scope only
-    python3 main.py --flash          # upload esp32_ads firmware first
+    python3 main.py --flash          # upload xiao_max1032 firmware first
 """
 
 import argparse
@@ -23,8 +23,8 @@ from adc_serial import AdcReader, find_port
 from scope_panel import ScopePanel
 
 # ============ CONFIG ============
-FQBN = "esp32:esp32:adafruit_feather_esp32s3"
-SKETCH = Path(__file__).resolve().parent / "esp32_ads"
+FQBN = "esp32:esp32:XIAO_ESP32C6:CDCOnBoot=cdc"
+SKETCH = Path(__file__).resolve().parent / "xiao_max1032"
 # ================================
 
 
@@ -41,6 +41,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="ESP32 serial port (default: auto-detect)")
+    ap.add_argument("--rate", type=float,
+                    help="ADC samples/s per channel (default: board max, ~17.9 kHz)")
+    ap.add_argument("--range", type=float, dest="range_v", default=12,
+                    help="ADC input range +/- volts: 3, 6 or 12 (default 12)")
     ap.add_argument("--no-camera", action="store_true", help="skip the Basler feed")
     ap.add_argument("--flash", action="store_true", help="upload the ESP32 firmware first")
     args = ap.parse_args()
@@ -49,7 +53,7 @@ def main():
     if args.flash:
         flash_firmware(port)  # before the reader opens the port
 
-    reader = AdcReader(port)
+    reader = AdcReader(port, rate=args.rate, range_v=args.range_v)
     reader.start()
 
     root = tk.Tk()

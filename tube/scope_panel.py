@@ -1,4 +1,4 @@
-"""Live 3-channel scope panel (Tk frame) fed by an AdcReader."""
+"""Live scope panel (Tk frame): one trace per ADC channel, fed by an AdcReader."""
 
 import tkinter as tk
 
@@ -7,19 +7,36 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from adc_serial import AdcReader
+from channels import CHANNEL_NAMES, COLORS, PLOT_ORDER
 
 # ============ CONFIG ============
 WINDOW_S = 10.0          # seconds of signal shown
 PLOT_FPS = 20
-# Indexed by ADC number (v0/v1/v2 in the data). ADDR pin sets which is which.
-CHANNEL_NAMES = ["Bottom ring (0x48)", "Middle ring (0x49)", "Top ring (0x4A)"]
-COLORS = ["tab:blue", "tab:orange", "tab:green"]
-PLOT_ORDER = [2, 1, 0]  # plot panels top-to-bottom like the tube: top ring first
+MAX_POINTS = 2000        # per trace after min/max decimation (~ screen width)
 # ================================
 
 
+def minmax_decimate(t, y, max_points=MAX_POINTS):
+    """Shrink a trace for drawing without hiding short spikes: keep the min and
+    max of each bucket (so 2 points per bucket)."""
+    n = len(t)
+    if n <= max_points:
+        return t, y
+    per = int(np.ceil(n / (max_points // 2)))
+    m = n // per * per
+    yb = y[:m].reshape(-1, per)
+    tb = t[:m].reshape(-1, per)
+    lo, hi = np.nanargmin(yb, axis=1), np.nanargmax(yb, axis=1)
+    first = np.minimum(lo, hi)
+    second = np.maximum(lo, hi)
+    rows = np.arange(len(yb))
+    tt = np.column_stack([tb[rows, first], tb[rows, second]]).ravel()
+    yy = np.column_stack([yb[rows, first], yb[rows, second]]).ravel()
+    return tt, yy
+
+
 class ScopePanel(tk.Frame):
-    """Three stacked, live-updating traces from an AdcReader."""
+    """Stacked, live-updating traces (one per channel) from an AdcReader."""
 
     def __init__(self, parent, reader: AdcReader, **kw):
         super().__init__(parent, **kw)
@@ -29,7 +46,7 @@ class ScopePanel(tk.Frame):
         self.autoscale = tk.BooleanVar(value=True)
 
         self.fig = Figure(figsize=(7, 6), dpi=100, layout="constrained")
-        self.axes = self.fig.subplots(3, 1, sharex=True)
+        self.axes = self.fig.subplots(len(PLOT_ORDER), 1, sharex=True)
         self.lines = []
         for ax, i in zip(self.axes, PLOT_ORDER):
             (line,) = ax.plot([], [], color=COLORS[i], lw=1)
@@ -75,13 +92,12 @@ class ScopePanel(tk.Frame):
 
     def _redraw(self):
         win = self._window()
-        t, vs = self.reader.snapshot()
-        if len(t):
-            keep = t >= t[-1] - win
-            tr = t[keep] - t[-1]
+        t, vs = self.reader.snapshot(last_s=win)
+        if len(t) and len(vs) == len(CHANNEL_NAMES):
+            tr = t - t[-1]
             for line, ax, v in zip(self.lines, self.axes, [vs[i] for i in PLOT_ORDER]):
-                vk = v[keep]
-                line.set_data(tr, vk)
+                td, vk = minmax_decimate(tr, v)
+                line.set_data(td, vk)
                 if self.autoscale.get():
                     finite = vk[np.isfinite(vk)]
                     if finite.size:
@@ -97,11 +113,12 @@ class ScopePanel(tk.Frame):
         self._rate = n - self._last_n
         self._last_n = n
         if r.connected:
-            txt = f"{r.port}  {self._rate:.0f} S/s"
-            if r.info:
-                missing = [s for s in r.info if "NOT FOUND" in s]
-                if missing:
-                    txt += "  [!] " + "; ".join(missing)
+            txt = f"{r.port}  {self._rate:.0f} S/s per channel"
+            if r.n_gaps:
+                txt += f"  [!] {r.n_gaps} gaps ({r.n_missing} samples lost)"
+            warn = [s for s in r.info if "WARNING" in s]
+            if warn:
+                txt += "  [!] " + warn[0].lstrip("# ")
         else:
             txt = f"[!] {r.err or 'connecting to ' + r.port + '…'}"
         self.status.config(text=txt)

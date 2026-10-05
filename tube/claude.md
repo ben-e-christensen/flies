@@ -1,110 +1,167 @@
-# Tube rig: charged-ball drop past 3 induction rings, with Basler video
+# Tube rig: charged-ball drop past induction rings, with Basler video
 
-State as of 2026-09-29. This file is meant to stand on its own: a reader who
+State as of 2026-10-02. This file is meant to stand on its own: a reader who
 can't see the code should still be able to follow the setup, the data and the
 findings so far. The original Basler notes are kept in the appendix at the end.
 
+**Status:** the ADC was switched on 2026-10-02 from 3× ADS1115 (500 SPS used,
+860 max) to a single MAX1032: 4 channels at about **17,800 samples/s per
+channel**, measured on the real board. Streaming, timing and saving have been
+verified on the hardware. At that first test the inputs looked unconnected
+(see Next steps), so there's no real electrometer data from the new board yet.
+All experimental findings below come from the old ADS1115 board.
+
 ## The experiment
 
-A charged ball is dropped down a vertical clear tube. The tube has three
-sensor rings (top, middle, bottom). Each ring feeds an electrometer, so a
-charge passing through a ring should show up as a blip on that channel. A
-high-speed Basler camera films the tube so the blips can be matched to the
-ball's position.
+A charged ball is dropped down a vertical clear tube. The tube has sensor rings
+(top, middle, bottom). Each ring feeds an electrometer, so a charge passing
+through a ring should show up as a blip on that channel. A high-speed Basler
+camera films the tube so the blips can be matched to the ball's position.
 
 ## Hardware
 
-- **Microcontroller:** Adafruit Feather ESP32-S3 (2MB PSRAM), USB native CDC
-  at `/dev/ttyACM0` (USB VID 0x239A, PID 0x811B). I2C on SDA=GPIO3, SCL=GPIO4
-  at 400 kHz. The board powers its I2C/STEMMA port through GPIO7 at boot.
-- **ADCs:** 3× ADS1115 (16-bit). Each channel's signal chain is
-  ring → electrometer (analog output) → INA159 level shifter (gain 0.2,
-  1.25 V reference) → ADS1115 input A0, single-ended.
+- **DAQ board:** Seeed XIAO ESP32-C6 plus a MAX1032 (14-bit SAR ADC, SPI,
+  internal 4.096 V reference, 115 ksps total across channels). Powered from
+  USB 5 V straight to DVDD (no protection diode on the XIAO), ferrite-filtered
+  5 V to AVDD, XIAO 3V3 to DVDDO for 3.3 V logic. USB-Serial/JTAG at
+  `/dev/ttyACM0` (USB VID 0x303A).
+- **SPI pins:** D8/GPIO19 SCLK, D9/GPIO20 DOUT (MISO), D10/GPIO18 DIN (MOSI),
+  D0/GPIO0 CS (10 k pull-up). SSTRB on D1 is unused.
+- **Inputs:** four electrometer outputs arrive on a DB9 from a separate
+  electrometer board. MAX1032 CH0–CH3 = Electro1–4, single-ended, ±12.288 V
+  range by default (selectable, see below). CH4–CH7 are grounded.
 
-  | ADS1115 ADDR pin | I2C address | ring | data column |
+  | MAX1032 | electrometer | ring | data column |
   |---|---|---|---|
-  | GND | 0x48 | **bottom** | `raw0` / `v0` |
-  | VDD (3.3 V) | 0x49 | **middle** | `raw1` / `v1` |
-  | SDA | 0x4A | **top** | `raw2` / `v2` |
+  | CH0 | Electro1 | **top** | `raw0` / `v0` |
+  | CH1 | Electro2 | none: **not connected, floating** | `raw1` / `v1` |
+  | CH2 | Electro3 | **middle** | `raw2` / `v2` |
+  | CH3 | Electro4 | **bottom** | `raw3` / `v3` |
 
-  A1–A3 are unused and float at about 0.59 V. A0 sits at about 1.245 V when
-  the electrometer output is zero, which is the INA159's 1.25 V pedestal.
+  Names, colors and plot order (top, middle, bottom, then the floating
+  channel) are set in `channels.py`.
+- **Gotchas from the board's bring-up:** an unplugged input reads a steady
+  +2.2 V, not 0 (the input is a ~17 kΩ network biased internally), so a loose
+  DB9 shows up as a fake +2.2 V. Input resistance ~17 kΩ, so sources must be
+  low impedance (op-amp outputs are fine). Measure noise with inputs shorted,
+  not floating.
+- **Relays/mains:** two relays switching a mains lamp sit on a separate XIAO
+  board, to keep mains noise away from the ADC.
 - **Camera:** Basler acA1440-220um (USB3, mono), 1440×1080 Mono8, gain 28 dB,
-  exposure usually 2000 µs. It has been verified at 200 fps full frame with 0
-  dropped frames. 10 s at 100 fps is about 1.6 GB in RAM; the PC has about
-  11 GB free.
+  exposure usually 2000 µs. Verified at 200 fps full frame with 0 dropped
+  frames. 10 s at 100 fps is about 1.6 GB in RAM; the PC has about 11 GB free.
 
 ## Converting counts to volts
 
-`V_in = 5 × (raw × 4.096/32768 − 1.25)`, which undoes the ADS1115 LSB
-(125 µV at ±4.096 V range) and the INA159 (gain 0.2, 1.25 V offset).
-raw 0 → −6.25 V, raw 10000 → 0 V, raw 20000 → +6.25 V. Resolution at the
-electrometer output is 625 µV per count. The full derivation is in the
-"ADC raw → voltage" section below.
+`V = (code − 8192) × LSB`. Codes are 14-bit offset binary (0x2000 = 0 V).
+The electrometer output goes straight into the MAX1032, so there's no
+pedestal or gain to undo. Codes 0 and 16383 mean the input is at or beyond
+the range (railed). The PC takes the zero code and LSB from the board's
+header rather than hard-coding them.
 
-If the ADS1115 range is changed, update three places: `PGA` and `FSR_V` in
-`esp32_ads.ino`, and `ADS_FSR_V` in `adc_serial.py`. Switching to ±2.048 V
-would halve the step to about 312 µV and still cover −6.25 V to +4.0 V at the
-input, because the pin sits at 1.25 V.
+The input range is set at runtime (`--range` on `main.py`, `capture.py`,
+`adc_serial.py`), the same for all channels:
 
-## Firmware (`esp32_ads/esp32_ads.ino`)
+| `--range` | MAX1032 code R[2:0] | span | LSB |
+|---|---|---|---|
+| 3 | 001 | ±3.072 V | 375 µV |
+| 6 | 100 | ±6.144 V | 750 µV |
+| **12 (default)** | 111 | ±12.288 V | 1.5 mV |
 
-- Each ADS1115 runs in continuous mode at 860 SPS. The ESP reads all three
-  every 2 ms (`SAMPLE_HZ = 500`) and prints one CSV line:
-  `t_us,raw0,raw1,raw2`, where `t_us` is the ESP's `micros()` at the read and
-  the values are signed counts (`nan` if a chip isn't answering). Conversion
-  to volts happens on the PC.
-- Lines starting with `#` are info. Commands the PC can send: `?` re-prints
-  the config header; `a` reads A0–A3 on every chip once and prints the pin
-  voltages (useful for finding which input a signal is on).
-- **Self-check:** an ADS1115 that loses power comes back powered down with its
-  output register at 0, and it still answers on I2C. Before this was handled,
-  the data went to raw 0 (−6.25 V) on every channel until the ESP was reset
-  (session `16-56-31`). Now the firmware reads back one chip's config every
-  20 ms, re-applies it if it doesn't match, and prints
-  `# ADCn 0x.. was reset (config 0x8583), reconfigured`.
-- Flash from the `tube/` folder (no Arduino IDE needed):
-  `arduino-cli compile --upload --fqbn esp32:esp32:adafruit_feather_esp32s3 -p /dev/ttyACM0 esp32_ads`
+The inputs tolerate ±16.5 V. The default was ±3.072 V until 2026-10-05,
+when the electrometer outputs were found to clip it. A live check across the
+three ranges that day: the middle ring clipped at +3.07 and +6.14 V and read
++9.12 V on ±12.288 V; the top ring clipped at both narrower ranges and swung
+−9.0 to −3.4 V on ±12.288 V; unclipped channels read the same in every range
+(bottom ring ≈ −2.4 V, floating channel ≈ +0.27–0.30 V), which confirms the
+codes and LSBs. Range codes came from memory of the datasheet (it couldn't be
+downloaded at the time); that check is what verifies them.
+
+## Firmware (`xiao_max1032/xiao_max1032.ino`)
+
+- Every sample period it converts CH0–CH3 back to back (external clock mode,
+  SPI at 3.64 MHz, just under the 3.67 MHz limit). The SPI peripheral drives
+  CS itself, one 32-bit transfer per conversion.
+- **Rate, measured on the board:** converting all four channels takes 45.9 µs
+  (the ideal is 35 µs: 4 × 32 SPI clocks; the rest is Arduino SPI overhead).
+  With 20% slack for packet/USB work the firmware allows up to ~18.2 kHz and
+  runs at 17,857 Hz (56 µs period) by default; it delivers ~17,750 samples/s
+  per channel (99.4%), longest gap between samples 116 µs, no lost packets.
+  At `--rate 10000` it delivers exactly 10,000/s. Going beyond ~18 kHz would
+  need register-level SPI code instead of the Arduino SPI library.
+- **Stream format:** packets of 64 samples:
+  `A5 5A | seq (u32) | t0_us (u32) | 64 × [dt_us (u16), code0..code3 (u16)] | xor8`
+  (651 bytes, ~10.2 bytes per sample, ~180 KB/s at 17.8 kHz).
+  `seq` counts samples since streaming started, so a jump means dropped
+  packets. **Every sample carries its real conversion time** (`t0_us + dt_us`),
+  so timing is exact even when the loop runs a little late; an earlier
+  version labeled samples with their scheduled time and was off by ~12% when
+  the board couldn't keep up.
+- **Commands:** `?` prints the text header (ends with `# end`; the
+  `# cfg key=value …` line has the rate, period, max rate, LSB, zero code,
+  packet layout); `r<hz>\n` sets the rate (capped at `max_hz`); `g<1|4|7>\n`
+  sets the input range (±3.072 / ±6.144 / ±12.288 V, default 7); `s` starts
+  streaming; `x` stops.
+- **Never blocks:** if the PC isn't reading fast enough, whole packets are
+  dropped and show up as `seq` gaps.
+- **ESP32-C6 gotcha:** on single-core chips the Arduino core pauses the main
+  loop for 5 ms every 2 s (`yieldIfNecessary()` → `vTaskDelay(5)`), which put
+  a 5 ms hole in the data every 2 s. The firmware now stays inside `loop()`
+  for the whole stream, and disables the idle-task watchdog.
+- Re-sends the channel config once a second, because the MAX1032 config can't
+  be read back and a supply glitch would reset it.
+- Flash from the `tube/` folder:
+  `arduino-cli compile --upload --fqbn esp32:esp32:XIAO_ESP32C6:CDCOnBoot=cdc -p /dev/ttyACM0 xiao_max1032`
+  (or `python3 main.py --flash`). If the port appears then vanishes: hold
+  BOOT, tap RESET, flash again.
+- The old ADS1115 firmware is kept in `legacy/esp32_ads/`.
 
 ## Software (all run from the `tube/` folder)
 
 | file | what it does |
 |---|---|
-| `main.py` | Live GUI. Basler feed on the left, 3 scrolling traces on the right (Pause, Clear, Autoscale Y, time window). `--flash` uploads the firmware first, `--no-camera` shows traces only, `--port` overrides the port. |
-| `capture.py` | Records into RAM and saves when done. First a noise floor (`--baseline`, default 10 s, ADC only), then the capture (`-d` seconds, `--fps`, `--exposure` µs, `--no-camera`). Prints `>>> RECORDING … Drop now. <<<` when it's time to drop. |
-| `view_adc.py` | Plots a session's charge data. Defaults to the newest session. `--baseline` shows the noise floor, `--raw` shows counts, `--smooth N` overlays a moving average. Titles show mean and std per ring. |
-| `make_video.py` | Makes two MP4s of a session, `…_raw.mp4` and `…_filtered.mp4` (60 Hz removed). Camera on the left; all three traces for the clip on the right with a red cursor at the current frame. Arguments: `start end` (inclusive, optional), `--speed` (default 0.1 × real time, so 200 fps plays at 20 fps), `--session`. Encodes with ffmpeg/libx264. |
-| `filters.py` | `notch_mains(t, y)`: removes 60, 120, 180 and 240 Hz with soft-edged notches (0.5 Hz sigma) over the whole record, keeping the DC level and fast blips. On synthetic data it cut 60+120 Hz hum from 14.6 to 0.9 mV RMS and passed a 15 ms, 10 mV blip at 9.96 mV. `make_video.py` runs it over noise floor + capture when a baseline exists. For display only; saved data stays raw. |
+| `main.py` | Live GUI. Basler feed on the left, one scrolling trace per channel on the right (Pause, Clear, Autoscale Y, time window). Traces are reduced to min/max per screen pixel so short spikes stay visible at ~18 kHz. `--rate`, `--flash`, `--no-camera`, `--port`. |
+| `capture.py` | Records into RAM and saves when done. First a noise floor (`--baseline`, default 10 s, ADC only), then the capture (`-d` seconds, `--fps`, `--exposure` µs, `--rate` ADC samples/s per channel, `--range` ADC input range in ±V: 3, 6 or 12 (default 12), `--no-camera`). Prints `>>> RECORDING … Drop now. <<<` when it's time to drop. |
+| `view_adc.py` | Plots a session's charge data (newest by default). `--baseline` shows the noise floor, `--raw` shows codes, `--smooth N` overlays a moving average. Titles show mean and std per channel. |
+| `make_video.py` | Makes two MP4s per run, `…_raw.mp4` and `…_filtered.mp4` (mains hum removed). Camera on the left; all channels for the clip on the right with a red cursor at the current frame. Arguments: `start end` (inclusive, optional), `--speed` (default 0.1 × real time), `--session`. |
+| `filters.py` | `remove_mains(t, y)`: finds the actual mains frequency (it drifts ~0.02 Hz), then fits 60 Hz and harmonics up to 600 Hz by least squares in overlapping 0.5 s windows and subtracts only the hum. Uses real sample times, so dropped packets don't matter. Tested on synthetic data: 15 mV RMS of hum down to the 0.3 mV noise floor; a 2 ms, 30 mV blip comes through at 29.2 mV; an 85 mV step is kept exactly (up to ~3 mV error right at the step). For display only; saved data stays raw. |
 | `vid.py` | Quick frame-by-frame viewer for `frames.npy` (a/d or arrow keys step, space plays, q quits). |
-| `adc_serial.py` | Serial reader thread used by everything else. Run directly to print live samples; `--pins` runs the A0–A3 pin check. |
+| `adc_serial.py` | Reads the board's stream in the background (used by everything else). Run directly for a once-a-second summary per channel: mean, rms noise, lost samples, railed codes. `--rate` sets the rate. |
+| `channels.py` | Channel names, colors and plot order, in one place (top ring, middle, bottom, floating). |
 | `sync.py` | Puts camera and ADC times on one clock (see below). |
-| `basler_feed.py`, `scope_panel.py` | The camera and plot panels used by `main.py`. Channel names, colors and plot order (top ring first) live in `scope_panel.py`. |
+| `basler_feed.py`, `scope_panel.py` | The camera and plot panels used by `main.py`. |
 
 Only one program can have the camera or the serial port open at a time. The
 port is opened exclusively, so a second program gets a "busy" error instead
-of both silently receiving scrambled data (which happened once during
-debugging). Close `main.py` before running `capture.py`.
+of both silently receiving scrambled data. Close `main.py` before running
+`capture.py`.
+
+The scripts run from the `particle-electrostatics-exp/.venv` Python
+environment (it has `pypylon`); the system Python doesn't.
 
 ## Session folder: `captures/session_<YYYY-MM-DD_HH-MM-SS>/`
 
 | file | contents |
 |---|---|
 | `baseline.csv` | Noise floor, same columns as `adc.csv`. `t` runs from −baseline to 0. |
-| `adc.csv` | `t,host_t,esp_t,raw0,raw1,raw2,v0,v1,v2`. About 500 rows per second. Raw and unfiltered. |
+| `adc.csv` | `t,host_t,esp_t,raw0..raw3,v0..v3`. About 17,800 rows per second (about 1.5 MB per second of CSV). Raw and unfiltered. |
 | `frames.npy` | `(n_frames, 1080, 1440)` uint8. Load with `np.load(p, mmap_mode='r')`. |
 | `frames.csv` | `index,t,host_t,cam_t,block_id`. Row `i` is frame `i` in `frames.npy`. |
-| `meta.txt` | `key<TAB>value`: settings, rates, dropped frames, `cam_sync`, and from the baseline `noise_std_mV` and `hum_60hz_amp_mV` per ring. |
+| `meta.txt` | `key<TAB>value`: settings, the board's `adc_cfg`, `channel_names`, `plot_order`, sample counts and lost samples, dropped frames, `cam_sync`, and from the baseline `noise_std_mV` and `hum_60hz_amp_mV` per channel. |
 | `video_*.mp4` | Output of `make_video.py`. |
 
 - `t`: synced time in seconds since the capture started. **Use this to match
   frames to ADC samples.** Frame `t` is the middle of its exposure.
-- `host_t`: when the PC received the sample. It includes transfer delay, so
-  don't use it for alignment.
+- `host_t`: when the PC received the data. ADC samples arrive in packets, so
+  it's the packet's arrival time. Don't use it for alignment.
 - `esp_t`, `cam_t`: each device's own clock (`cam_t` in ns).
 
-Captures made before about 17:30 on 2026-09-29 have no `t` column or baseline.
-The scripts fall back to an approximate alignment for those and print a
-warning.
+Sessions from the old ADS1115 board (before 2026-10) have 3 channels
+(`raw0..2`, `v0..2` = bottom, middle, top ring), 500 rows per second, and a
+different conversion (see the legacy section below). The viewers detect this
+and label them correctly. Sessions before about 17:30 on 2026-09-29 also lack
+the `t` column and baseline; the scripts fall back to an approximate alignment
+for those and print a warning.
 
 ## Timing and sync (`sync.py`)
 
@@ -116,16 +173,19 @@ warning.
 - **Why not arrival time:** frames reach the PC 5.5–7.5 ms after mid-exposure
   (exposure, 4.4 ms sensor readout, USB transfer). The first version aligned
   on arrival and labeled every frame about 8 ms late.
-- **ADC:** the ESP clock is aligned by assuming the fastest-arriving line had
-  essentially no USB delay. Lines arrive 1.2–3.2 ms after their synced time,
-  so this is good to about 1 ms. Then 1/860 s is subtracted, because the value
-  read at `esp_t` comes from a conversion that averaged over the previous
-  ~1.2 ms.
+- **ADC:** each sample's board time is its real conversion time. The board
+  clock is aligned to the PC by assuming the fastest-arriving packet had
+  essentially no USB delay, which is good to about 1 ms. The MAX1032 samples
+  at the start of each conversion, so no further correction is applied. CH1–3
+  are converted ~11 µs after the channel before; small next to the 56 µs
+  sample period. (The old ADS1115 board
+  needed a 1/860 s correction; it's still applied to its sessions.)
 - **Overall:** the software alignment is good to a few ms at worst. Any delay
-  inside the electrometers or INA159s is *not* corrected: the timestamp marks
-  when the ESP read the voltage, not when the charge was at the ring.
+  inside the electrometers is *not* corrected: the timestamp marks when the
+  ADC sampled, not when the charge was at the ring.
 
-## Findings so far
+## Findings so far (old ADS1115 board, 500 SPS per channel)
+
 
 **60 Hz mains pickup dominates the noise.**
 - Early on it was about ±20 mV at the electrometer scale (about ±4 mV at the
@@ -154,7 +214,7 @@ pixels across.
 
 It falls at roughly 8,500 px/s, so it crosses a ring band in about 15 ms.
 
-With the 60 Hz removed (FFT notch at 60/120/180/240 Hz):
+With the 60 Hz removed (FFT notch at 60/120/180/240 Hz, the first filter version):
 - **Top and middle rings:** no visible response as the ball passes (under
   ±5 mV).
 - **Bottom ring:** a step from about −31 to +55 mV starting at 2.78 s, right
@@ -176,23 +236,30 @@ work and the fly-by is being lost to bandwidth.
 
 ## Next steps
 
+- **Check the inputs on the new board.** At the first real test (2026-10-02,
+  firmware flashed and streaming fine) the channels read: CH0 (top ring) and
+  CH3 (bottom ring) swinging rail to rail (≈2.3 V RMS, mostly 60 Hz at
+  2.4–3 V amplitude), CH2 (middle ring) pinned at +3.07 V (top of range).
+  That looks like the electrometers weren't connected or powered. CH1 sat
+  steady at +2.16 V, which is expected: Electro2 isn't connected, and a
+  floating MAX1032 input reads about +2.2 V.
+  Then do the scale check against a known voltage and record the
+  shorted-input noise floor per channel (`python3 adc_serial.py`).
 - Run the hold-and-withdraw test above. Check the electrometers' integration
-  time and filter settings.
+  time and filter settings: at ~18 kHz the ADC is no longer the bottleneck, so
+  if fly-bys are still missing, the electrometers are the next suspect.
 - Reduce the 60 Hz at the source (shielding, grounding, twisted or shielded
-  cable). The passage signals are 5–35 mV at most, so this matters more than
-  anything on the software side.
-- Analysis ideas: add the 60 Hz filter to `view_adc.py` too (it's in
-  `make_video.py` already); fit and subtract the exact hum from the noise
-  floor; detect blips automatically against the noise floor.
-- Hardware headroom if needed: ADS1115 up to 860 SPS (`SAMPLE_HZ`), ±2.048 V
-  range for 2× resolution, camera faster than 200 fps with a shorter exposure.
+  cable). The passage signals were 5–35 mV at most on the old board.
+- Analysis ideas: add the mains filter to `view_adc.py` too; detect blips
+  automatically against the noise floor; at ~18 kHz, look at blip shape, not
+  just whether one exists.
 
 ---
 
-## ADC raw → voltage (derivation)
+## Legacy: ADS1115 raw → voltage (old board, sessions before 2026-10)
 
 Each electrometer signal goes through an **INA159** level-shifting amplifier
-and then into an **ADS1115** (16-bit, PGA set to ±4.096 V). In this rig the
+and then into an **ADS1115** (16-bit, PGA set to ±4.096 V). On the old board the
 raw ADS1115 count arrives over serial as a signed integer (`raw0..2`).
 
 **The math:**
