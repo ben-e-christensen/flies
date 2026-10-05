@@ -22,12 +22,14 @@ IS_LINUX = platform.system() == 'Linux'
 WINDOWS_PORTS = {
     'arduino':  5,
     'keithley': 8,
+    'esp32':    9,
 }
 
 # Linux: device paths for the same instruments.
 LINUX_PORTS = {
     'arduino':  '/dev/ttyACM0',
     'keithley': '/dev/ttyUSB0',
+    'esp32':    '/dev/ttyACM1',
 }
 
 # Kept for older code that did `from coms import ports`.

@@ -19,3 +19,6 @@ cam_data/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Burst captures from tube/capture.py
+tube/captures/

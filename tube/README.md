@@ -1,0 +1,1 @@
+arduino-cli compile --upload --fqbn esp32:esp32:adafruit_feather_esp32s3 -p /dev/ttyACM0 esp32_ads
